@@ -344,13 +344,17 @@ async function startV3AnalysisFlow() {
 
     const {
       speakers,
+      speakerDisplays,
       messages: filteredMessages,
       counts,
-      allSpeakers
+      allSpeakers,
+      canonicalDisplayMap
     } = selectTopTwoSpeakers(parsedMessages);
 
-    // 將整理後的數據存入全域狀態，供後續分析階段直接調用 (V2.2 核心更新：鎖定一致性)
+    // 將整理後的數據存入全域狀態，供後續分析階段直接調用
     appState.activeSpeakers = speakers;
+    appState.activeSpeakerDisplays = speakerDisplays;
+    appState.canonicalDisplayMap = canonicalDisplayMap;
     appState.parsedMessages = filteredMessages;
 
     if (allSpeakers.length > 2) {
@@ -359,11 +363,11 @@ async function startV3AnalysisFlow() {
 
     ui.identityPicker.classList.remove("hidden");
     ui.speakerButtons.innerHTML = "";
-    speakers.forEach(name => {
+    speakers.forEach((key, index) => {
       const btn = document.createElement("button");
       btn.className = "speaker-btn";
-      btn.textContent = name;
-      btn.onclick = () => runAnalysis(name);
+      btn.textContent = speakerDisplays[index];
+      btn.onclick = () => runAnalysis(key);
       ui.speakerButtons.appendChild(btn);
     });
 
@@ -371,21 +375,35 @@ async function startV3AnalysisFlow() {
       ? "DEMO 模式載入成功！請點擊您的暱稱以開始判定。"
       : "檔案解析成功！請點擊您的暱稱以開始鑑定。";
 
-    ui.emptyState.innerHTML = `<p>已讀取到 <strong>${speakers.join(" & ")}</strong> 的回憶。<br>請在上方點擊您的名字，系統將以您的視角進行鑑定。</p>`;
+    ui.emptyState.innerHTML = `<p>已讀取到 <strong>${speakerDisplays.join(" & ")}</strong> 的回憶。<br>請在上方點擊您的名字，系統將以您的視角進行鑑定。</p>`;
 
   } catch (error) {
-    ui.statusBox.textContent = `解析失敗：${error.message}`;
+    console.error(error);
+    const msg = String(error.message || "");
+
+    if (msg.includes("[E_DATE_PARSE]")) {
+      ui.statusBox.textContent = "解析失敗：日期格式無法辨識，請確認是 LINE 匯出的聊天檔。";
+    } else if (msg.includes("[E_TIME_PARSE]")) {
+      ui.statusBox.textContent = "解析失敗：時間格式無法辨識，請確認是 LINE 匯出的聊天檔。";
+    } else if (msg.includes("[E_TIMESTAMP_INVALID]")) {
+      ui.statusBox.textContent = "解析失敗：時間資料異常，請重新確認聊天紀錄格式。";
+    } else {
+      ui.statusBox.textContent = `解析失敗：${error.message}`;
+    }
   }
 }
 
 async function runAnalysis(subjectName) {
   try {
     appState.subjectSpeaker = subjectName;
+    const displayMap = appState.canonicalDisplayMap || {};
+    const displayName = displayMap[subjectName] || subjectName;
+
     ui.identityPicker.classList.add("hidden");
     ui.loadingState.classList.remove("hidden");
     ui.emptyState.classList.add("hidden");
     ui.resultState.classList.add("hidden");
-    ui.statusBox.textContent = `正在以 ${subjectName} 的視角進行量化掃描...`;
+    ui.statusBox.textContent = `正在以 ${displayName} 的視角進行量化掃描...`;
 
     await fakeComputeDelay();
 
@@ -553,15 +571,37 @@ function parseLineChat(rawText) {
   return parsedMessages;
 }
 
+function isValidIsoDate(isoDate) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(isoDate) && isoDate !== "1970-01-01";
+}
+
+function isValidTimeString(timeText) {
+  return /^\d{2}:\d{2}$/.test(timeText) && timeText !== "00:00";
+}
+
 function buildMessage(dateText, timeText, speaker, content) {
   const isoDate = normalizeDate(dateText);
   const normalizedTime = normalizeLineTime(timeText);
+
+  if (!isValidIsoDate(isoDate)) {
+    throw new Error(`[E_DATE_PARSE] 無法解析日期：${dateText}`);
+  }
+
+  if (!isValidTimeString(normalizedTime)) {
+    throw new Error(`[E_TIME_PARSE] 無法解析時間：${timeText}`);
+  }
+
   const timestamp = new Date(`${isoDate}T${normalizedTime}:00`);
+
+  if (Number.isNaN(timestamp.getTime())) {
+    throw new Error(`[E_TIMESTAMP_INVALID] 無法建立時間戳：${dateText} ${timeText}`);
+  }
 
   return {
     dateText: isoDate,
     timeText: normalizedTime,
     speaker: speaker.trim(),
+    speakerDisplay: speaker.trim(),
     content: content.trim(),
     timestamp,
     wordCount: countWords(content),
@@ -638,12 +678,22 @@ function consolidateSpeakers(messages) {
     }
   }
 
+  const canonicalDisplayMap = {};
+  for (const msg of messages) {
+    const raw = normalizeSpeakerName(msg.speaker);
+    const merged = aliasMap[raw] || raw;
+    if (!canonicalDisplayMap[merged]) {
+      canonicalDisplayMap[merged] = msg.speakerDisplay || msg.speaker;
+    }
+  }
+
   const normalizedMessages = messages.map(msg => {
     const raw = normalizeSpeakerName(msg.speaker);
     const merged = aliasMap[raw] || raw;
     return {
       ...msg,
-      speaker: merged,
+      speaker: merged, // internal key
+      speakerDisplay: canonicalDisplayMap[merged] || msg.speakerDisplay || msg.speaker,
     };
   });
 
@@ -655,11 +705,12 @@ function consolidateSpeakers(messages) {
   return {
     messages: normalizedMessages,
     counts: finalCounts,
+    canonicalDisplayMap,
   };
 }
 
 function selectTopTwoSpeakers(messages) {
-  const { messages: normalizedMessages, counts } = consolidateSpeakers(messages);
+  const { messages: normalizedMessages, counts, canonicalDisplayMap } = consolidateSpeakers(messages);
 
   const sorted = Object.keys(counts).sort((a, b) => counts[b] - counts[a]);
   console.log("raw speakers found:", sorted, counts);
@@ -673,9 +724,11 @@ function selectTopTwoSpeakers(messages) {
 
   return {
     speakers: topTwo,
+    speakerDisplays: topTwo.map(k => canonicalDisplayMap[k] || k),
     messages: filteredMessages,
     counts,
     allSpeakers: sorted,
+    canonicalDisplayMap,
   };
 }
 
@@ -785,7 +838,7 @@ function isSystemMessage(content) {
   const trimmed = content.trim();
 
   // 中文 / 英文系統訊息
-  if (/^(收回了訊息|已取消|you unsent a message\.?)$/i.test(trimmed)) {
+  if (/^(收回了訊息|已取消|you unsent a message\.?|this message was deleted\.?)$/i.test(trimmed)) {
     return true;
   }
 
@@ -795,7 +848,7 @@ function isSystemMessage(content) {
   }
 
   // 通話相關
-  if (/^☎\s*(call time|missed call|canceled call|no answer)/i.test(trimmed)) {
+  if (/^☎\s*(call time|missed call|canceled call|cancelled call|no answer)$/i.test(trimmed)) {
     return true;
   }
 
@@ -804,7 +857,7 @@ function isSystemMessage(content) {
     return true;
   }
 
-  if (/(joined the group|left the group)$/i.test(trimmed)) {
+  if (/(joined the group|left the group|invited .* to the group)$/i.test(trimmed)) {
     return true;
   }
 
@@ -2220,7 +2273,8 @@ function classifyRelationship(input) {
 
     const fillers = new Set([
       "嗯","恩","喔","哦","好","對","對啊","是喔","有哇","真假","原來","還好","還好欸",
-      "哈哈","哈哈哈","lol","ok","okay","k","hmm","uhh","yeah","yep","nope"
+      "哈哈","哈哈哈","lol","ok","okay","k","hmm","uhh","yeah","yep","nope",
+      "oh","ah","mm","uh","welp","ic","icic"
     ]);
 
     const meaningfulShortReplies = new Set([
@@ -2228,7 +2282,8 @@ function classifyRelationship(input) {
       "不要","要","會","不會","到了","快到了","還沒","醒了","睡著了","知道了","收到",
       "下班了","回家了",
       "yes","no","maybe","later","tomorrow","not today","busy","on my way","arrived",
-      "not yet","got it","received","sure","cant","can't","can","cannot"
+      "not yet","got it","received","sure","cant","can't","can","cannot",
+      "im busy","i'm busy","at work","working","home","coming","almost there","not now"
     ]);
 
     if (meaningfulShortReplies.has(normalized)) return false;
@@ -2237,30 +2292,18 @@ function classifyRelationship(input) {
 
   function isStopToken(token) {
     return new Set([
-      "我",
-      "你",
-      "他",
-      "她",
-      "的",
-      "了",
-      "嗎",
-      "呢",
-      "啊",
-      "呀",
-      "喔",
-      "哦",
-      "欸",
-      "是",
-      "有",
-      "在",
-      "就",
-      "也",
-      "都",
-      "很",
-      "還",
-      "但",
-      "那",
-      "這",
+      "我","你","他","她","的","了","嗎","呢","啊","呀","喔","哦","欸","是","有","在","就","也","都","很","還","但","那","這",
+      "i","you","he","she","it","we","they",
+      "me","him","her","us","them",
+      "my","your","his","their","our",
+      "the","a","an",
+      "is","am","are","was","were","be","been","being",
+      "do","does","did",
+      "have","has","had",
+      "to","of","in","on","at","for","with","from","by",
+      "this","that","these","those",
+      "and","or","but","so","if","then",
+      "what","why","when","where","how"
     ]).has(token);
   }
 
