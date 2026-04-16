@@ -340,29 +340,49 @@ async function startV3AnalysisFlow() {
 
     const messages = parseLineChat(appState.rawText);
 
-    const speakerCounts = messages.reduce((acc, message) => {
+    const initialSpeakerCounts = messages.reduce((acc, message) => {
       const key = message.speaker.trim();
       acc[key] = (acc[key] || 0) + 1;
       return acc;
     }, {});
 
-    const sortedSpeakers = Object.keys(speakerCounts).sort(
-      (a, b) => speakerCounts[b] - speakerCounts[a]
+    // 相似名字自動合併 (處理如 "邱煜書 Shu" 與 "邱煜書" 的重複問題)
+    let speakerKeys = Object.keys(initialSpeakerCounts).sort((a, b) => b.length - a.length);
+    let finalSpeakerCounts = { ...initialSpeakerCounts };
+
+    for (let i = 0; i < speakerKeys.length; i++) {
+      for (let j = i + 1; j < speakerKeys.length; j++) {
+        const longName = speakerKeys[i];
+        const shortName = speakerKeys[j];
+        if (longName && shortName && longName.includes(shortName)) {
+          if (finalSpeakerCounts[shortName]) {
+            finalSpeakerCounts[longName] += finalSpeakerCounts[shortName];
+            delete finalSpeakerCounts[shortName];
+            // 同步更新訊息對象
+            messages.forEach(m => {
+              if (m.speaker.trim() === shortName) m.speaker = longName;
+            });
+          }
+        }
+      }
+    }
+
+    const sortedSpeakers = Object.keys(finalSpeakerCounts).sort(
+      (a, b) => finalSpeakerCounts[b] - finalSpeakerCounts[a]
     );
 
-    console.log("detected speakers (sorted by frequency):", sortedSpeakers);
-    console.log("speakerCounts map:", speakerCounts);
-    console.table(messages.slice(0, 30));
+    console.log("consolidated speakers:", sortedSpeakers);
 
     if (sortedSpeakers.length < 2) {
       throw new Error(`解析失敗：只辨識到一位說話者 (${sortedSpeakers[0] || "無"})，請確認匯格式。`);
     }
 
-    if (sortedSpeakers.length > 2) {
-      throw new Error(`目前僅支援二人對話分析。偵測到 ${sortedSpeakers.length} 位說話者：${sortedSpeakers.join(" / ")}`);
-    }
+    // 取對話量最高的前兩位 (自動排除群組雜訊或 parser 誤判的零星名字)
+    const speakers = sortedSpeakers.slice(0, 2);
 
-    const speakers = sortedSpeakers;
+    if (sortedSpeakers.length > 2) {
+      console.warn(`偵測到 ${sortedSpeakers.length} 位說話者，系統已自動選取主要二人：${speakers.join(" & ")}`);
+    }
 
     ui.identityPicker.classList.remove("hidden");
     ui.speakerButtons.innerHTML = "";
@@ -377,7 +397,6 @@ async function startV3AnalysisFlow() {
     ui.statusBox.textContent = appState.isDemoMode
       ? "DEMO 模式載入成功！請點擊下方你的暱稱以開始判定。"
       : "檔案解析成功！請選擇你的暱稱以開始鑑定。";
-
 
     ui.emptyState.innerHTML = `<p>已讀取到 <strong>${speakers.join(" & ")}</strong> 的回憶。<br>請在上方點擊你的名字，系統將以你的視角進行拓補分析。</p>`;
 
