@@ -850,7 +850,15 @@ function isSystemMessage(content) {
   }
 
   // 通話相關
-  if (/^☎\s*(call time|missed call|canceled call|cancelled call|no answer)$/i.test(trimmed)) {
+  if (
+    /^(☎\s*)?(call time|missed call|canceled call|cancelled call|no answer|voice call|video call)$/i.test(trimmed)
+  ) {
+    return true;
+  }
+
+  if (
+    /^(未接來電|通話時間|已取消通話|語音通話|視訊通話|無人接聽)$/.test(trimmed)
+  ) {
     return true;
   }
 
@@ -865,6 +873,50 @@ function isSystemMessage(content) {
 
   return false;
 }
+
+function shouldUseTrailingSilence(messages) {
+  if (!messages.length) return false;
+  const lastMsg = messages[messages.length - 1];
+  const ageMinutes = (Date.now() - lastMsg.timestamp.getTime()) / 60000;
+  // 超過 14 天的聊天紀錄就不算當前沉默 (避免 Date.now() 誤殺歷史紀錄)
+  return ageMinutes <= 14 * 24 * 60;
+}
+
+function buildSpeakerBlocks(messages, validSpeakers = null) {
+  const blocks = [];
+
+  for (const message of messages) {
+    if (validSpeakers && !validSpeakers.has(message.speaker)) continue;
+
+    const lastBlock = blocks[blocks.length - 1];
+    if (
+      lastBlock &&
+      lastBlock.speaker === message.speaker &&
+      (message.timestamp.getTime() - lastBlock.lastTimestamp.getTime()) / 60000 <= BLOCK_MERGE_WINDOW_MINUTES
+    ) {
+      lastBlock.messages.push(message);
+      lastBlock.content += ` ${message.content}`;
+      lastBlock.wordCount += message.wordCount;
+      lastBlock.lastTimestamp = message.timestamp;
+      lastBlock.endTimeText = message.timeText;
+    } else {
+      blocks.push({
+        speaker: message.speaker,
+        messages: [message],
+        content: message.content,
+        wordCount: message.wordCount,
+        firstTimestamp: message.timestamp,
+        lastTimestamp: message.timestamp,
+        dateText: message.dateText,
+        startTimeText: message.timeText,
+        endTimeText: message.timeText,
+      });
+    }
+  }
+
+  return blocks;
+}
+
 
 function analyzeMessages(messages, subjectName = null) {
   const speakers = [...new Set(messages.map((message) => message.speaker))];
@@ -881,29 +933,31 @@ function analyzeMessages(messages, subjectName = null) {
     [speakerA, speakerB] = speakers;
   }
 
-  const responsePairs = buildResponsePairs(messages, speakerA, speakerB);
+  // 【V2.6 重要架構變更】統一使用 Speaker Blocks 進行主要分析
+  const blocks = buildSpeakerBlocks(messages);
+  const responsePairs = buildResponsePairs(blocks);
 
   // 【致命破口一：已修復】處理完全無回覆的斷線狀況
   if (!responsePairs.length) {
-    return buildFallbackZombieResult([speakerA, speakerB], messages.length);
+    return buildFallbackNeutralResult([speakerA, speakerB], messages.length);
   }
 
   const responseTimes = responsePairs.map((pair) => pair.responseMinutes);
   const baselineMrt = median(responseTimes);
 
-  // --- 【終極防禦：自適應死寂注入】 ---
-  // 不再使用死板的 48h 門檻，改用「相對時間比」。
-  // 如果對話結束後的死寂時間 > 對話總時長的 20%，或者 > 平均延遲的 10 倍，即視為異常結束（斷線）。
+  // --- 【終極防禦：歷史紀錄保護】 ---
   const firstMsg = messages[0];
   const lastMsg = messages[messages.length - 1];
   const chatDuration = (lastMsg.timestamp.getTime() - firstMsg.timestamp.getTime()) / 60000;
 
+  // 如果對話太舊 (或是匯出檔)，就不強制算當前的 Date.now() 沉默，避免誤殺
+  const useTrailingSilence = appState.isDemoMode || shouldUseTrailingSilence(messages);
+
   const nowMs = appState.isDemoMode
     ? lastMsg.timestamp.getTime() + 1000 * 60 * 5
-    : new Date().getTime();
+    : (useTrailingSilence ? Date.now() : lastMsg.timestamp.getTime());
 
   const trailingSilence = (nowMs - lastMsg.timestamp.getTime()) / 60000;
-
 
   const jitterData = [...responseTimes];
   const isAbnormalSilence = trailingSilence > Math.max(
@@ -913,7 +967,6 @@ function analyzeMessages(messages, subjectName = null) {
   );
 
   if (isAbnormalSilence) {
-
     jitterData.push(trailingSilence);
   }
 
@@ -921,7 +974,6 @@ function analyzeMessages(messages, subjectName = null) {
   const stabilityFlag = jitter > baselineMrt ? "UNSTABLE" : "STABLE";
 
   let latencyTotal = 0;
-
   let payloadTotal = 0;
   let packetLoss = 0;
 
@@ -950,13 +1002,13 @@ function analyzeMessages(messages, subjectName = null) {
     payloadTotal += payloadScore;
   });
 
-
   const avgLatencyScore = latencyTotal / responsePairs.length;
   const avgPayloadScore = payloadTotal / responsePairs.length;
   const rawScore = 0.6 * avgLatencyScore + 0.4 * avgPayloadScore;
 
-  const rawGhostingPenalty = computeGhostingPenalty(messages);
-  const rawDoublePingPenalty = computeDoublePingPenalty(messages);
+  // 【V2.6】懲罰計算全面改由 Block 驅動
+  const rawGhostingPenalty = computeGhostingPenalty(blocks, messages.length);
+  const rawDoublePingPenalty = computeDoublePingPenalty(blocks);
 
   const rawPacketLossPenalty = packetLoss * 6;
 
@@ -967,7 +1019,9 @@ function analyzeMessages(messages, subjectName = null) {
 
   const finalSyncRate = clamp(Math.round(rawScore * 100 - penaltyTotal), 0, 100);
 
-  // Using jitter and stabilityFlag calculated with virtual latency at function start
+  // 判定是否進入「低樣本保守模式」
+  const isConservative = messages.length < 16 || responsePairs.length < 6;
+
   const initiationBias = computeInitiationBias(messages, speakerA, speakerB);
   const messageBalance = computeMessageBalance(messages, speakerA, speakerB);
   const anxietySignal = hasAnxietySignal(messages);
@@ -1001,6 +1055,7 @@ function analyzeMessages(messages, subjectName = null) {
     initiationBias,
     messageBalance,
     anxietySignal,
+    isConservative, // 傳入保守模式標記
   });
 
   const inputForClassification = {
@@ -1017,6 +1072,7 @@ function analyzeMessages(messages, subjectName = null) {
     initiationBias,
     messageBalance,
     jitterMinutes: jitter,
+    isConservative, // 傳入保守模式標記
   };
 
   // 【惡魔修復】實施非對稱地位判定
@@ -1069,11 +1125,11 @@ function analyzeMessages(messages, subjectName = null) {
     finalSyncRate,
     dogType,
     dogCharacter: DOG_CHARACTER_META[dogType] || DOG_CHARACTER_META["邊境牧羊犬型"], // 防呆 fallback
-
     counterpartType,
     counterpartCharacter: DOG_CHARACTER_META[counterpartType] || DOG_CHARACTER_META["邊境牧羊犬型"], // 防呆 fallback
     relationshipModel,
     personalityMix,
+    isConservative,
     debug: { // 新增 Debug Metadata 方便原因追查
       povSpeaker,
       counterpartName,
@@ -1087,7 +1143,8 @@ function analyzeMessages(messages, subjectName = null) {
       isPursuer,
       baselineMrt: round(baselineMrt),
       trailingSilence: round(trailingSilence),
-      isAbnormalSilence
+      isAbnormalSilence,
+      useTrailingSilence
     }
   };
 
@@ -1117,42 +1174,7 @@ function analyzeMessages(messages, subjectName = null) {
   };
 }
 
-function buildResponsePairs(messages, speakerA, speakerB) {
-  const validSpeakers = new Set([speakerA, speakerB]);
-  const blocks = [];
-
-  for (const message of messages) {
-    if (!validSpeakers.has(message.speaker)) {
-      continue;
-    }
-
-    const lastBlock = blocks[blocks.length - 1];
-    if (
-      lastBlock &&
-      lastBlock.speaker === message.speaker &&
-      (message.timestamp.getTime() - lastBlock.lastTimestamp.getTime()) / 60000 <= BLOCK_MERGE_WINDOW_MINUTES
-    ) {
-
-      lastBlock.messages.push(message);
-      lastBlock.content += ` ${message.content}`;
-      lastBlock.wordCount += message.wordCount;
-      lastBlock.lastTimestamp = message.timestamp;
-      lastBlock.endTimeText = message.timeText;
-    } else {
-      blocks.push({
-        speaker: message.speaker,
-        messages: [message],
-        content: message.content,
-        wordCount: message.wordCount,
-        firstTimestamp: message.timestamp,
-        lastTimestamp: message.timestamp,
-        dateText: message.dateText,
-        startTimeText: message.timeText,
-        endTimeText: message.timeText,
-      });
-    }
-  }
-
+function buildResponsePairs(blocks) {
   const pairs = [];
 
   for (let index = 1; index < blocks.length; index += 1) {
@@ -1197,41 +1219,31 @@ function buildResponsePairs(messages, speakerA, speakerB) {
   return pairs;
 }
 
-function computeGhostingPenalty(messages) {
+function computeGhostingPenalty(blocks, totalMessageCount) {
+  if (!blocks.length) return 0;
 
-  if (!messages.length) {
-    return 0;
+  const lastBlock = blocks[blocks.length - 1];
+  const lastBlockMessageCount = lastBlock.messages?.length || 1;
+
+  if (blocks.length === 1) {
+    return lastBlockMessageCount >= 4 ? 10 : 0;
   }
 
-  const lastMessage = messages[messages.length - 1];
-  let trailingCount = 1;
-  let index = messages.length - 2;
-
-  while (index >= 0 && messages[index].speaker === lastMessage.speaker) {
-    trailingCount += 1; index -= 1;
-  }
-
-  if (index < 0) {
-    return trailingCount >= 4 ? 10 : 0;
-  }
-
-  const previousOtherSideMessage = messages[index];
+  const prevOtherBlock = blocks[blocks.length - 2];
   const minutesSinceLastReply =
-    (lastMessage.timestamp.getTime() - previousOtherSideMessage.timestamp.getTime()) / 60000;
+    (lastBlock.lastTimestamp.getTime() - prevOtherBlock.lastTimestamp.getTime()) / 60000;
 
-  if (messages.length < 12 && trailingCount <= 2) {
-    return 0;
-  }
+  if (totalMessageCount < 12 && lastBlockMessageCount <= 2) return 0;
 
-  if (minutesSinceLastReply >= GHOSTING_HEAVY_MINUTES && trailingCount >= 3) {
+  if (minutesSinceLastReply >= GHOSTING_HEAVY_MINUTES && lastBlockMessageCount >= 3) {
     return GHOSTING_SEVERE_MULTIPLIER;
   }
 
-  if (minutesSinceLastReply >= GHOSTING_HEAVY_MINUTES && trailingCount >= 2) {
+  if (minutesSinceLastReply >= GHOSTING_HEAVY_MINUTES && lastBlockMessageCount >= 2) {
     return GHOSTING_HEAVY_MULTIPLIER;
   }
 
-  if (minutesSinceLastReply >= GHOSTING_LIGHT_MINUTES && trailingCount >= 2) {
+  if (minutesSinceLastReply >= GHOSTING_LIGHT_MINUTES && lastBlockMessageCount >= 2) {
     return GHOSTING_LIGHT_MULTIPLIER;
   }
 
@@ -1240,30 +1252,24 @@ function computeGhostingPenalty(messages) {
 
 
 
-  function computeDoublePingPenalty(messages) {
-    let worstPenalty = 0;
-    let runStart = 0;
+function computeDoublePingPenalty(blocks) {
+  let penalty = 0;
 
-    function evaluateRun(runMessages) {
-      if (runMessages.length < 2) return 0;
-      let penalty = 0;
-      for (let i = 1; i < runMessages.length; i++) {
-        const gap = (runMessages[i].timestamp.getTime() - runMessages[i - 1].timestamp.getTime()) / 60000;
-        if (gap <= DOUBLE_PING_SHORT_GAP) penalty += 6;
-        else if (gap <= DOUBLE_PING_MEDIUM_GAP) penalty += 3;
-      }
-      return penalty;
-    }
+  for (const block of blocks) {
+    if (!block.messages || block.messages.length < 2) continue;
 
-    for (let i = 1; i < messages.length; i++) {
-      if (messages[i].speaker !== messages[runStart].speaker) {
-        worstPenalty += evaluateRun(messages.slice(runStart, i));
-        runStart = i;
-      }
+    for (let i = 1; i < block.messages.length; i++) {
+      const prev = block.messages[i - 1];
+      const curr = block.messages[i];
+      const gap = (curr.timestamp.getTime() - prev.timestamp.getTime()) / 60000;
+
+      if (gap <= DOUBLE_PING_SHORT_GAP) penalty += 6;
+      else if (gap <= DOUBLE_PING_MEDIUM_GAP) penalty += 3;
     }
-    worstPenalty += evaluateRun(messages.slice(runStart));
-    return worstPenalty;
   }
+
+  return penalty;
+}
 
   function computeInitiationBias(messages, speakerA, speakerB) {
     const sessions = [];
@@ -1614,6 +1620,13 @@ function resolvePrimaryType(scores, input) {
   const [secondName, secondScore] = sorted[1] || ["柴犬型", 0];
   const gap = topScore - secondScore;
 
+  // 【V2.6 保守模式】如果樣本太少，強制回傳穩定型態
+  if (input.isConservative) {
+    if (STABLE_TYPES.has(topName)) return topName;
+    if (STABLE_TYPES.has(secondName)) return secondName;
+    return "黃金獵犬型"; // 終極安全 fallback
+  }
+
   if (DRAMATIC_TYPES.has(topName)) {
     const dramaticGatePassed = passesDramaticGate(topName, topScore, gap, input);
 
@@ -1747,10 +1760,12 @@ function classifyRelationship(input) {
   const dominantMessageShare = Math.max(...Object.values(input.messageBalance));
 
   if (input.rawGhostingPenalty >= 15 || input.syncRate < 15) {
+    if (input.isConservative) return "普通往來";
     return "斷線關係";
   }
 
   if (input.ghostingPenalty >= 12 && input.syncRate < 35) {
+    if (input.isConservative) return "普通往來";
     return "斷線關係";
   }
 
@@ -1839,10 +1854,10 @@ function classifyRelationship(input) {
     const systemLikeCount = messages.filter((message) => /\[(貼圖|照片|圖片|影片|語音訊息)\]/.test(message.content)).length;
     const nonTextRatio = systemLikeCount / Math.max(messages.length, 1);
 
-    if (responsePairs.length < 10) score -= 30;
-    else if (responsePairs.length < 20) score -= 18;
-    else if (responsePairs.length < 40) score -= 10;
-    else if (responsePairs.length < 120) score -= 4;
+    if (responsePairs.length < 10) score -= 20;
+    else if (responsePairs.length < 20) score -= 12;
+    else if (responsePairs.length < 40) score -= 6;
+    else if (responsePairs.length < 120) score -= 2;
 
     if (nonTextRatio > 0.35) score -= 14;
     else if (nonTextRatio > 0.2) score -= 6;
@@ -1966,8 +1981,12 @@ function classifyRelationship(input) {
     stabilityFlag,
     finalSyncRate,
   }) {
+    const displayMap = appState.canonicalDisplayMap || {};
+    const nameA = displayMap[speakerA] || speakerA;
+    const nameB = displayMap[speakerB] || speakerB;
+
     return `graph LR
-    A(("${speakerA}")) -- "Baseline MRT: ${round(baselineMrt)} min" --> B(("${speakerB}"))
+    A(("${nameA}")) -- "Baseline MRT: ${round(baselineMrt)} min" --> B(("${nameB}"))
     B -- "Latency Score: ${round(avgLatencyScore)}" --> A
     A -- "Payload Score: ${round(avgPayloadScore)}" --> B
     S["Stability: ${stabilityFlag}"] --> A
@@ -2243,6 +2262,12 @@ function classifyRelationship(input) {
     if (requestTokens.length < 3) return false;
     if (!responseText || !responseTokens.length) return true;
 
+    if (
+      /\b(yes|no|maybe|later|tomorrow|busy|working|coming|arrived|home|sure|ok|okay|got it|received|not yet|on my way|at work|sounds good|probably|still)\b/i.test(responseText)
+    ) {
+      return false;
+    }
+
     if (/(今天|明天|晚點|等等|現在|剛剛|下班|到家|吃飯|開會|忙完|回家|today|tomorrow|later|now|just now|after work|home|at home|eating|in a meeting|busy|done|finished|yes|no|maybe|arrived|got it|received|sure)/i.test(responseText)) return false;
 
     if (responseTokens.length <= 3) return isLowSignalReply(response.content);
@@ -2374,6 +2399,49 @@ function classifyRelationship(input) {
       },
       mermaid: `graph LR\n    A(("${speakers[0]}")) -- "No Connection" --> B(("${speakers[1] || "對方"}"))`,
       verdict: "連線早就終止，你還在對著已關閉的埠口送出心跳包。目前模型判定為「斷線關係」，同步率 0%，總懲罰爆表。",
+    };
+  }
+
+  function buildFallbackNeutralResult(speakers, messageCount) {
+    const dogCharacter = DOG_CHARACTER_META["柴犬型"];
+    const displayMap = appState.canonicalDisplayMap || {};
+    const participantDisplays = speakers.map(k => displayMap[k] || k);
+
+    return {
+      metadata: {
+        participants: speakers,
+        participantDisplays,
+        messageCount,
+        responsePairCount: 0,
+        baselineMRTMinutes: 0,
+        latencyScore: 0,
+        payloadScore: 0,
+        jitterMinutes: 0,
+        stabilityFlag: "STABLE",
+        packetLossCount: 0,
+        messageBalance: {},
+        confidence: { value: 45, label: "Low" },
+        impactDrivers: ["樣本不足", "無法穩定建立回應配對"],
+        penalties: {
+          ghosting: 0,
+          doublePinging: 0,
+          packetLoss: 0,
+          total: 0,
+          rawGhosting: 0,
+          rawDoublePinging: 0,
+          rawPacketLoss: 0,
+        },
+        finalSyncRate: 50,
+        dogType: "柴犬型",
+        dogCharacter,
+        counterpartType: "柴犬型",
+        counterpartCharacter: dogCharacter,
+        relationshipModel: "普通往來",
+        personalityMix: [],
+        isConservative: true,
+      },
+      mermaid: `graph LR\nA(("${participantDisplays[0] || speakers[0]}")) --> B(("${participantDisplays[1] || speakers[1] || "對方"}"))`,
+      verdict: "這段資料太短，系統先保守判為普通往來，不直接上升到斷線或殭屍級別。",
     };
   }
 
