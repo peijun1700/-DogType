@@ -189,6 +189,13 @@ const DOG_CHARACTER_META = {
   },
 };
 
+const softTemplates = {
+  貴賓狗型: "你這邊回覆得蠻用心，整體互動偏體面穩定。",
+  柴犬型: "互動節奏比較慢一些，但目前還看不出明確斷線。",
+  黃金獵犬型: "你這邊投入感比較明顯，是偏溫柔輸出的類型。",
+  邊境牧羊犬型: "雙方有一定來回，整體互動算順。",
+};
+
 const appState = {
   file: null,
   rawText: "",
@@ -937,8 +944,12 @@ function analyzeMessages(messages, subjectName = null) {
   const blocks = buildSpeakerBlocks(messages);
   const responsePairs = buildResponsePairs(blocks);
 
-  // 【致命破口一：已修復】處理完全無回覆的斷線狀況
+  // 【V2.7.1】處理完全無回覆的斷線狀況 (孤兒邏輯接回)
   if (!responsePairs.length) {
+    const rawGhostingPenalty = computeGhostingPenalty(blocks, messages.length);
+    if (rawGhostingPenalty >= 12 && messages.length >= 8) {
+      return buildFallbackZombieResult([speakerA, speakerB], messages.length);
+    }
     return buildFallbackNeutralResult([speakerA, speakerB], messages.length);
   }
 
@@ -1020,7 +1031,11 @@ function analyzeMessages(messages, subjectName = null) {
   const finalSyncRate = clamp(Math.round(rawScore * 100 - penaltyTotal), 0, 100);
 
   // 判定是否進入「低樣本保守模式」
-  const isConservative = messages.length < 16 || responsePairs.length < 6;
+  const dayCount = new Set(messages.map(m => m.dateText)).size;
+  const isConservative =
+    messages.length < 20 ||
+    responsePairs.length < 8 ||
+    dayCount <= 1;
 
   const initiationBias = computeInitiationBias(messages, speakerA, speakerB);
   const messageBalance = computeMessageBalance(messages, speakerA, speakerB);
@@ -1073,6 +1088,8 @@ function analyzeMessages(messages, subjectName = null) {
     messageBalance,
     jitterMinutes: jitter,
     isConservative, // 傳入保守模式標記
+    responsePairCount: responsePairs.length,
+    confidenceValue: confidence.value,
   };
 
   // 【惡魔修復】實施非對稱地位判定
@@ -1144,7 +1161,10 @@ function analyzeMessages(messages, subjectName = null) {
       baselineMrt: round(baselineMrt),
       trailingSilence: round(trailingSilence),
       isAbnormalSilence,
-      useTrailingSilence
+      useTrailingSilence,
+      blockCount: blocks.length,
+      lastBlockMessageCount: blocks[blocks.length - 1]?.messages?.length || 0,
+      dayCount: new Set(messages.map(m => m.dateText)).size,
     }
   };
 
@@ -1159,7 +1179,7 @@ function analyzeMessages(messages, subjectName = null) {
     finalSyncRate,
   });
 
-  return {
+  let result = {
     metadata,
     mermaid,
     verdict: buildVerdict({
@@ -1172,6 +1192,20 @@ function analyzeMessages(messages, subjectName = null) {
       subjectSpeaker: povSpeaker,
     }),
   };
+
+  result = applySafetyOverride(result);
+
+  result.verdict = buildVerdict({
+    dogType: result.metadata.dogType,
+    relationshipModel: result.metadata.relationshipModel,
+    finalSyncRate: result.metadata.finalSyncRate,
+    metrics: inputForClassification,
+    stabilityFlag: result.metadata.stabilityFlag,
+    penaltyTotal: result.metadata.penalties.total,
+    subjectSpeaker: povSpeaker,
+  });
+
+  return result;
 }
 
 function buildResponsePairs(blocks) {
@@ -1258,14 +1292,25 @@ function computeDoublePingPenalty(blocks) {
   for (const block of blocks) {
     if (!block.messages || block.messages.length < 2) continue;
 
+    let localPenalty = 0;
+
     for (let i = 1; i < block.messages.length; i++) {
       const prev = block.messages[i - 1];
       const curr = block.messages[i];
       const gap = (curr.timestamp.getTime() - prev.timestamp.getTime()) / 60000;
 
-      if (gap <= DOUBLE_PING_SHORT_GAP) penalty += 6;
-      else if (gap <= DOUBLE_PING_MEDIUM_GAP) penalty += 3;
+      if (gap <= 15) localPenalty += 4;
+      else if (gap <= 60) localPenalty += 2;
+      else if (gap <= DOUBLE_PING_MEDIUM_GAP) localPenalty += 1;
     }
+
+    // 兩句補充通常不該太重
+    if (block.messages.length === 2) {
+      localPenalty = Math.max(0, localPenalty - 2);
+    }
+
+    // 封頂避免單一區塊爆炸
+    penalty += Math.min(localPenalty, 10);
   }
 
   return penalty;
@@ -1335,9 +1380,15 @@ function computeDogSignals(input, targetSpeaker, counterpartPower = 0) {
     (input.jitterMinutes >= 180 || input.anxietySignal);
 
   const nearZombie =
-    input.ghostingPenalty >= 12 ||
-    input.rawGhostingPenalty >= 15 ||
-    (input.syncRate < 30 && input.relationshipModel === "斷線關係");
+    (
+      input.ghostingPenalty >= 12 &&
+      (input.responsePairCount || 0) >= 4 &&
+      !input.isConservative
+    ) ||
+    (
+      input.syncRate < 30 &&
+      input.relationshipModel === "斷線關係"
+    );
 
   return {
     myInitiation,
@@ -1620,7 +1671,12 @@ function resolvePrimaryType(scores, input) {
   const [secondName, secondScore] = sorted[1] || ["柴犬型", 0];
   const gap = topScore - secondScore;
 
-  // 【V2.6 保守模式】如果樣本太少，強制回傳穩定型態
+  if ((input.confidenceValue || 100) < 55) {
+    if (STABLE_TYPES.has(topName)) return topName;
+    if (STABLE_TYPES.has(secondName)) return secondName;
+    return "貴賓狗型";
+  }
+
   if (input.isConservative) {
     if (STABLE_TYPES.has(topName)) return topName;
     if (STABLE_TYPES.has(secondName)) return secondName;
@@ -1701,9 +1757,13 @@ function passesDramaticGate(type, topScore, gap, input) {
 
     case "殭屍狗型":
       return (
+        !input.isConservative &&
+        input.relationshipModel === "斷線關係" &&
+        input.ghostingPenalty >= 12 &&
+        input.syncRate <= 20 &&
+        (input.responsePairCount || 0) >= 4 &&
         topScore >= 45 &&
-        gap >= 10 &&
-        (input.ghostingPenalty >= 12 || input.syncRate < 20)
+        gap >= 10
       );
 
     case "吉娃娃型":
@@ -1733,6 +1793,110 @@ function fallbackStableType(sorted, input) {
 
   return "貴賓狗型";
 }
+
+
+  function buildVerdict({ dogType, relationshipModel, finalSyncRate, stabilityFlag, penaltyTotal, metrics, subjectSpeaker }) {
+    const isMaster = ["高冷黑貓型", "佛系和尚狗型", "狼系主宰型"].includes(dogType);
+    const keyCounterpart = metrics && metrics.initiationBias
+      ? Object.keys(metrics.initiationBias).find(name => name !== subjectSpeaker) || "對方"
+      : "對方";
+
+    const displayMap = appState.canonicalDisplayMap || {};
+    const counterpart = displayMap[keyCounterpart] || keyCounterpart;
+
+    let targetDogForCounterpart = "流浪狗";
+    if (relationshipModel === "雙向同步") targetDogForCounterpart = "邊境牧羊犬";
+    if (relationshipModel === "單向輸出") targetDogForCounterpart = "黃金獵犬";
+    if (relationshipModel === "斷線關係") targetDogForCounterpart = "殭屍狗";
+
+    const masterTemplates = {
+      "高冷黑貓型": `${counterpart} 目前是你的 ${targetDogForCounterpart}。你優雅地維持著距離，對方的熱情在其眼中只是背景音。`,
+      "佛系和尚狗型": `${counterpart} 只是你參禪路上的 ${targetDogForCounterpart}。你情緒穩定如磐石，對方的起伏完全無法動搖你的法身。`,
+      "狼系主宰型": `${counterpart} 已被你馴化為 ${targetDogForCounterpart}。你掌握著絕對的話語權，每一次回覆都精準地控制著對方的呼吸。`
+    };
+
+    const templates = {
+      邊境牧羊犬型: "你不是在舔，你是在維持一條雙向低延遲的私有光纖。",
+      黃金獵犬型: "你負責提供情緒價值，對方負責把通知欄當收件匣。",
+      貴賓狗型: "你每次回覆都像提案簡報，但對方只回了會後摘要。",
+      柴犬型: "你以為是穩住節奏，系統紀錄看起來比較像故意延遲 ACK。",
+      流浪狗型: "你不是在聊天，你在做高頻 retry，還順便把自尊當封包送出去。",
+      警犬型: "你的回覆速度已經不是心動，是即時監控等級的常駐程序。",
+      殭屍狗型: "連線早就終止，你還在對著已關閉的埠口送出心跳包。",
+    };
+
+    const fallback =
+      relationshipModel === "普通往來"
+        ? "目前看起來比較像一般互動，還沒強到可以直接蓋章成某種關係劇本。"
+        : "系統已完成互動拓撲掃描。";
+
+    const useSoftVerdict =
+      (metrics && metrics.isConservative) ||
+      (metrics && (metrics.confidenceValue || 100) < 60);
+
+    const mainText = useSoftVerdict
+      ? (softTemplates[dogType] || fallback)
+      : (isMaster ? masterTemplates[dogType] : (templates[dogType] || fallback));
+
+    return `${mainText} 目前模型判定為「${relationshipModel}」，同步率 ${finalSyncRate}%，穩定性 ${stabilityFlag}，總懲罰 ${penaltyTotal}。`;
+  }
+
+  function applySafetyOverride(result) {
+    const m = result.metadata;
+    const dramatic = new Set([
+      "殭屍狗型",
+      "流浪狗型",
+      "吉娃娃型",
+      "警犬型",
+      "高冷黑貓型",
+      "狼系主宰型"
+    ]);
+
+    if (!dramatic.has(m.dogType)) return result;
+
+    let overridden = false;
+
+    if (m.isConservative) {
+      m.dogType = "黃金獵犬型";
+      m.dogCharacter = DOG_CHARACTER_META["黃金獵犬型"];
+      overridden = true;
+    }
+
+    if (m.responsePairCount < 4) {
+      m.dogType = "柴犬型";
+      m.dogCharacter = DOG_CHARACTER_META["柴犬型"];
+      overridden = true;
+    }
+
+    if ((m.confidence?.value || 100) < 55) {
+      m.dogType = "貴賓狗型";
+      m.dogCharacter = DOG_CHARACTER_META["貴賓狗型"];
+      overridden = true;
+    }
+
+    // 斷線但證據不夠，降級
+    if (
+      m.dogType === "殭屍狗型" &&
+      (m.relationshipModel !== "斷線關係" || m.penalties.ghosting < 12)
+    ) {
+      m.dogType = "柴犬型";
+      m.dogCharacter = DOG_CHARACTER_META["柴犬型"];
+      overridden = true;
+    }
+
+    if (overridden) {
+      m.personalityMix = [
+        {
+          name: m.dogType.replace("型", ""),
+          percentage: 100,
+          color: m.dogCharacter.accent
+        }
+      ];
+    }
+
+    return result;
+  }
+
   function calculatePersonalityMix(scores, primaryType = null) {
     const personalityScores = { ...scores };
 
@@ -1759,13 +1923,13 @@ function classifyRelationship(input) {
   const dominantBias = Math.max(...Object.values(input.initiationBias));
   const dominantMessageShare = Math.max(...Object.values(input.messageBalance));
 
-  if (input.rawGhostingPenalty >= 15 || input.syncRate < 15) {
-    if (input.isConservative) return "普通往來";
-    return "斷線關係";
-  }
+  const hardDisconnect =
+    !input.isConservative &&
+    input.rawGhostingPenalty >= 12 &&
+    input.ghostingPenalty >= 12 &&
+    input.syncRate <= 25;
 
-  if (input.ghostingPenalty >= 12 && input.syncRate < 35) {
-    if (input.isConservative) return "普通往來";
+  if (hardDisconnect) {
     return "斷線關係";
   }
 
@@ -1807,47 +1971,6 @@ function classifyRelationship(input) {
 
   return "普通往來";
 }
-
-
-  function buildVerdict({ dogType, relationshipModel, finalSyncRate, stabilityFlag, penaltyTotal, metrics, subjectSpeaker }) {
-    const isMaster = ["高冷黑貓型", "佛系和尚狗型", "狼系主宰型"].includes(dogType);
-    const keyCounterpart = metrics && metrics.initiationBias
-      ? Object.keys(metrics.initiationBias).find(name => name !== subjectSpeaker) || "對方"
-      : "對方";
-
-    const displayMap = appState.canonicalDisplayMap || {};
-    const counterpart = displayMap[keyCounterpart] || keyCounterpart;
-
-    let targetDogForCounterpart = "流浪狗";
-    if (relationshipModel === "雙向同步") targetDogForCounterpart = "邊境牧羊犬";
-    if (relationshipModel === "單向輸出") targetDogForCounterpart = "黃金獵犬";
-    if (relationshipModel === "斷線關係") targetDogForCounterpart = "殭屍狗";
-
-    const masterTemplates = {
-      "高冷黑貓型": `${counterpart} 目前是你的 ${targetDogForCounterpart}。你優雅地維持著距離，對方的熱情在其眼中只是背景音。`,
-      "佛系和尚狗型": `${counterpart} 只是你參禪路上的 ${targetDogForCounterpart}。你情緒穩定如磐石，對方的起伏完全無法動搖你的法身。`,
-      "狼系主宰型": `${counterpart} 已被你馴化為 ${targetDogForCounterpart}。你掌握著絕對的話語權，每一次回覆都精準地控制著對方的呼吸。`
-    };
-
-    const templates = {
-      邊境牧羊犬型: "你不是在舔，你是在維持一條雙向低延遲的私有光纖。",
-      黃金獵犬型: "你負責提供情緒價值，對方負責把通知欄當收件匣。",
-      貴賓狗型: "你每次回覆都像提案簡報，但對方只回了會後摘要。",
-      柴犬型: "你以為是穩住節奏，系統紀錄看起來比較像故意延遲 ACK。",
-      流浪狗型: "你不是在聊天，你在做高頻 retry，還順便把自尊當封包送出去。",
-      警犬型: "你的回覆速度已經不是心動，是即時監控等級的常駐程序。",
-      殭屍狗型: "連線早就終止，你還在對著已關閉的埠口送出心跳包。",
-    };
-
-    const fallback =
-      relationshipModel === "普通往來"
-        ? "目前看起來比較像一般互動，還沒強到可以直接蓋章成某種關係劇本。"
-        : "系統已完成互動拓撲掃描。";
-
-    const mainText = isMaster ? masterTemplates[dogType] : (templates[dogType] || fallback);
-
-    return `${mainText} 目前模型判定為「${relationshipModel}」，同步率 ${finalSyncRate}%，穩定性 ${stabilityFlag}，總懲罰 ${penaltyTotal}。`;
-  }
 
   function computeConfidence({ messages, responsePairs, packetLoss, stabilityFlag }) {
     let score = 100;
@@ -2253,33 +2376,51 @@ function classifyRelationship(input) {
     return false;
   }
 
+  function isSoftAcknowledgement(text) {
+    return [
+      /還行/,
+      /還好/,
+      /可以啊?/,
+      /不行欸?/,
+      /晚點/,
+      /等等/,
+      /在忙/,
+      /忙完/,
+      /先不要/,
+      /之後再/,
+      /再看看/,
+      /應該/,
+      /沒事/,
+      /知道了/,
+      /收到/,
+      /\b(yes|no|maybe|later|tomorrow|busy|working|coming|arrived|home|sure|ok|okay|got it|received|not yet|on my way|at work|sounds good|probably|still)\b/i
+    ].some((pattern) => pattern.test(text));
+  }
+
   function isIrrelevantReply(request, response) {
     const responseText = normalizeSemanticText(response.content);
     const requestTokens = semanticTokens(request.content);
     const responseTokens = semanticTokens(response.content);
 
-
     if (requestTokens.length < 3) return false;
     if (!responseText || !responseTokens.length) return true;
 
-    if (
-      /\b(yes|no|maybe|later|tomorrow|busy|working|coming|arrived|home|sure|ok|okay|got it|received|not yet|on my way|at work|sounds good|probably|still)\b/i.test(responseText)
-    ) {
+    if (isSoftAcknowledgement(responseText)) {
       return false;
     }
 
-    if (/(今天|明天|晚點|等等|現在|剛剛|下班|到家|吃飯|開會|忙完|回家|today|tomorrow|later|now|just now|after work|home|at home|eating|in a meeting|busy|done|finished|yes|no|maybe|arrived|got it|received|sure)/i.test(responseText)) return false;
-
-    if (responseTokens.length <= 3) return isLowSignalReply(response.content);
+    if (responseTokens.length <= 3) {
+      return isLowSignalReply(response.content);
+    }
 
     const requestKeywords = extractKeywords(request.content);
     const responseKeywords = extractKeywords(response.content);
-    const overlap = requestKeywords.filter((keyword) => responseKeywords.includes(keyword));
+    const overlap = requestKeywords.filter((keyword) =>
+      responseKeywords.includes(keyword)
+    );
 
     if (overlap.length > 0) return false;
-
-
-    return responseTokens.length <= 3 && isLowSignalReply(response.content);
+    return true;
   }
 
   function extractKeywords(content) {
