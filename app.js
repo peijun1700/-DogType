@@ -340,11 +340,29 @@ async function startV3AnalysisFlow() {
 
     const messages = parseLineChat(appState.rawText);
 
-    const speakers = [...new Set(messages.map((message) => message.speaker))];
+    const speakerCounts = messages.reduce((acc, message) => {
+      const key = message.speaker.trim();
+      acc[key] = (acc[key] || 0) + 1;
+      return acc;
+    }, {});
 
-    if (speakers.length !== 2) {
-      throw new Error("目前僅支援二人對話分析。");
+    const sortedSpeakers = Object.keys(speakerCounts).sort(
+      (a, b) => speakerCounts[b] - speakerCounts[a]
+    );
+
+    console.log("detected speakers (sorted by frequency):", sortedSpeakers);
+    console.log("speakerCounts map:", speakerCounts);
+    console.table(messages.slice(0, 30));
+
+    if (sortedSpeakers.length < 2) {
+      throw new Error(`解析失敗：只辨識到一位說話者 (${sortedSpeakers[0] || "無"})，請確認匯格式。`);
     }
+
+    if (sortedSpeakers.length > 2) {
+      throw new Error(`目前僅支援二人對話分析。偵測到 ${sortedSpeakers.length} 位說話者：${sortedSpeakers.join(" / ")}`);
+    }
+
+    const speakers = sortedSpeakers;
 
     ui.identityPicker.classList.remove("hidden");
     ui.speakerButtons.innerHTML = "";
