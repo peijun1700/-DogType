@@ -340,63 +340,22 @@ async function startV3AnalysisFlow() {
       appState.isDemoMode = false;
     }
 
-    const messages = parseLineChat(appState.rawText);
+    const parsedMessages = parseLineChat(appState.rawText);
 
-    const initialSpeakerCounts = messages.reduce((acc, message) => {
-      const key = message.speaker.trim();
-      acc[key] = (acc[key] || 0) + 1;
-      return acc;
-    }, {});
+    const {
+      speakers,
+      messages: filteredMessages,
+      counts,
+      allSpeakers
+    } = selectTopTwoSpeakers(parsedMessages);
 
-    // 相似名字自動合併 (處理如 "邱煜書 Shu" 與 "邱煜書" 的重複問題)
-    let speakerKeys = Object.keys(initialSpeakerCounts).sort((a, b) => b.length - a.length);
-    let finalSpeakerCounts = { ...initialSpeakerCounts };
-
-    for (let i = 0; i < speakerKeys.length; i++) {
-      for (let j = i + 1; j < speakerKeys.length; j++) {
-        const longName = speakerKeys[i];
-        const shortName = speakerKeys[j];
-
-        const shortCount = finalSpeakerCounts[shortName] || 0;
-        const longCount = finalSpeakerCounts[longName] || 0;
-
-        // 【安全合併條件】：長包含短、短名字長度至少 2、且短名字訊息量佔比極低 (避免吃掉活躍人物)
-        const safeToMerge =
-          longName.includes(shortName) &&
-          shortName.length >= 2 &&
-          shortCount <= Math.max(3, longCount * 0.2);
-
-        if (safeToMerge && finalSpeakerCounts[shortName]) {
-          finalSpeakerCounts[longName] += finalSpeakerCounts[shortName];
-          delete finalSpeakerCounts[shortName];
-          // 同步更新訊息對象
-          messages.forEach(m => {
-            if (m.speaker.trim() === shortName) m.speaker = longName;
-          });
-        }
-      }
-    }
-
-    const sortedSpeakers = Object.keys(finalSpeakerCounts).sort(
-      (a, b) => finalSpeakerCounts[b] - finalSpeakerCounts[a]
-    );
-
-    console.log("consolidated speakers:", sortedSpeakers);
-
-    if (sortedSpeakers.length < 2) {
-      throw new Error(`解析失敗：僅辨識到一位說話者 (${sortedSpeakers[0] || "無"})，請確認匯出檔格式。`);
-    }
-
-    // 取對話量最高的前兩位 (自動排除群組雜訊或 parser 誤判的零星名字)
-    const speakers = sortedSpeakers.slice(0, 2);
-
-    if (sortedSpeakers.length > 2) {
-      console.warn(`偵測到 ${sortedSpeakers.length} 位說話者，系統已選取主要二人：${speakers.join(" & ")}`);
-    }
-
-    // 將整理後的數據存入全域狀態，供後續分析階段直接調用
+    // 將整理後的數據存入全域狀態，供後續分析階段直接調用 (V2.2 核心更新：鎖定一致性)
     appState.activeSpeakers = speakers;
-    appState.parsedMessages = messages.filter(m => speakers.includes(m.speaker));
+    appState.parsedMessages = filteredMessages;
+
+    if (allSpeakers.length > 2) {
+      console.warn("偵測到多個名字版本或雜訊，系統已自動選取主要二位：", speakers, counts);
+    }
 
     ui.identityPicker.classList.remove("hidden");
     ui.speakerButtons.innerHTML = "";
@@ -412,7 +371,7 @@ async function startV3AnalysisFlow() {
       ? "DEMO 模式載入成功！請點擊您的暱稱以開始判定。"
       : "檔案解析成功！請點擊您的暱稱以開始鑑定。";
 
-    ui.emptyState.innerHTML = `<p>已讀取到 <strong>${speakers.join(" & ")}</strong> 的回憶。<br>請在上方點擊你的名字，系統將以你的視角進行拓補分析。</p>`;
+    ui.emptyState.innerHTML = `<p>已讀取到 <strong>${speakers.join(" & ")}</strong> 的回憶。<br>請在上方點擊您的名字，系統將以您的視角進行鑑定。</p>`;
 
   } catch (error) {
     ui.statusBox.textContent = `解析失敗：${error.message}`;
@@ -586,6 +545,116 @@ function buildMessage(dateText, timeText, speaker, content) {
     content: content.trim(),
     timestamp,
     wordCount: countWords(content),
+  };
+}
+
+// --- 【V2.2 安全補丁：說話者識別優化】 ---
+
+function normalizeSpeakerName(name) {
+  return String(name || "")
+    .replace(/^\uFEFF/, "")
+    .trim()
+    .replace(/\s+/g, " ")          // 多空白壓成一格
+    .replace(/[＿_]+/g, "_")       // 全半形底線統一
+    .replace(/[－—–-]+/g, "-")     // 各種連字號統一
+    .toLowerCase();
+}
+
+function buildSpeakerCounts(messages) {
+  const counts = {};
+  for (const m of messages) {
+    const key = normalizeSpeakerName(m.speaker);
+    if (!key) continue;
+    counts[key] = (counts[key] || 0) + 1;
+  }
+  return counts;
+}
+
+function shouldMergeSpeaker(longName, shortName, longCount, shortCount) {
+  if (!longName || !shortName) return false;
+  if (longName === shortName) return false;
+
+  // 只允許「短名字被完整包含在長名字中」
+  if (!longName.includes(shortName)) return false;
+
+  // 太短不合，避免「陳」「王」「林」這種誤吞
+  if (shortName.length < 3) return false;
+
+  // 短名必須真的很少，才像 parser 殘影
+  if (shortCount > 3) return false;
+
+  // 長名也要夠多，才值得吞
+  if (longCount < 8) return false;
+
+  // 比例必須很懸殊
+  if (shortCount > longCount * 0.15) return false;
+
+  // 長短差至少 2 字元，避免相近但不同人名誤吞
+  if ((longName.length - shortName.length) < 2) return false;
+
+  return true;
+}
+
+function consolidateSpeakers(messages) {
+  const counts = buildSpeakerCounts(messages);
+  const names = Object.keys(counts).sort((a, b) => b.length - a.length);
+
+  const aliasMap = {};
+  for (const name of names) aliasMap[name] = name;
+
+  for (let i = 0; i < names.length; i++) {
+    const longName = names[i];
+    if (!counts[longName]) continue;
+
+    for (let j = i + 1; j < names.length; j++) {
+      const shortName = names[j];
+      if (!counts[shortName]) continue;
+
+      if (shouldMergeSpeaker(longName, shortName, counts[longName], counts[shortName])) {
+        counts[longName] += counts[shortName];
+        delete counts[shortName];
+        aliasMap[shortName] = longName;
+      }
+    }
+  }
+
+  const normalizedMessages = messages.map(msg => {
+    const raw = normalizeSpeakerName(msg.speaker);
+    const merged = aliasMap[raw] || raw;
+    return {
+      ...msg,
+      speaker: merged,
+    };
+  });
+
+  const finalCounts = {};
+  for (const msg of normalizedMessages) {
+    finalCounts[msg.speaker] = (finalCounts[msg.speaker] || 0) + 1;
+  }
+
+  return {
+    messages: normalizedMessages,
+    counts: finalCounts,
+  };
+}
+
+function selectTopTwoSpeakers(messages) {
+  const { messages: normalizedMessages, counts } = consolidateSpeakers(messages);
+
+  const sorted = Object.keys(counts).sort((a, b) => counts[b] - counts[a]);
+
+  if (sorted.length < 2) {
+    throw new Error(`分析失敗：僅辨識到一位說話者 (${sorted[0] || "無"})。請確認檔案格式或視角是否正確。`);
+  }
+
+  const topTwo = sorted.slice(0, 2);
+  const filteredMessages = normalizedMessages.filter(m => topTwo.includes(m.speaker));
+
+  return {
+    speakers: topTwo,
+    messages: filteredMessages,
+    counts,
+    allSpeakers: sorted,
   };
 }
 
