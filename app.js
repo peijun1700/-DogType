@@ -422,28 +422,46 @@ function parseLineChat(rawText) {
   let currentMessage = null;
 
   for (const row of rows) {
-    // 1) 日期列：2026/04/10（五） or 2026-04-10
-    const dateMatch = row.match(/^(\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2})/);
+    // A. 中文 / 純數字日期列
+    // 例如：
+    // 2026/04/10（日）
+    // 2026-04-10
+    const numericDateMatch = row.match(/^(\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2})/);
 
-    // 2) 完整日期 + 時間 + 名字 + 內容
+    // B. 英文日期列
+    // 例如：
+    // Sun, 08/18/2024
+    // Tue, 9/7/2024
+    const englishDateMatch = row.match(
+      /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat),\s+(\d{1,2}[\/.-]\d{1,2}[\/.-]\d{4})$/i
+    );
+
+    // C. 完整日期 + 時間 + 名字 + 內容
+    // 例如：
+    // 2026/04/10 09:10 阿晨: 早安
+    // [2026/04/10 下午 8:34] 阿晨: 哈哈
     const bracketMatch = row.match(
-      /^\[?(\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2})\s+((?:上午|下午)?\s*\d{1,2}:\d{2})\]?\s+([^:：\t]+)[:：]\s*(.+)$/
+      /^\[?(\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2})\s+((?:上午|下午|中午|凌晨|AM|PM|am|pm)?\s*\d{1,2}:\d{2})\]?\s+([^:：\t]+)[:：]\s*(.+)$/
     );
 
     const inlineMatch = row.match(
-      /^(\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2})\s+((?:上午|下午)?\s*\d{1,2}:\d{2})\s+([^:：]+)[:：]\s*(.+)$/
+      /^(\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2})\s+((?:上午|下午|中午|凌晨|AM|PM|am|pm)?\s*\d{1,2}:\d{2})\s+([^:：]+)[:：]\s*(.+)$/
     );
 
-    // 3) 你原本主吃的格式：時間 tab 名字 tab 內容
+    // D. LINE 常見 tab 格式
+    // 例如：
+    // 09:10\t阿晨\t早安
+    // 8:05 PM\tJohn\tHello
     const tabbedMatch = row.match(
-      /^((?:上午|下午)?\s*\d{1,2}:\d{2})(?:\s+|\t+)([^:\t]+?)(?:\s*[:：]|\t)(.+)$/
+      /^((?:上午|下午|中午|凌晨|AM|PM|am|pm)?\s*\d{1,2}:\d{2}|\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)?)(?:\s+|\t+)([^:\t]+?)(?:\s*[:：]|\t)(.+)$/
     );
 
-    // 4) 寬鬆格式：時間 + 名字 + 內容（不靠 tab）
-    // 例如：09:10 阿晨 早安
-    // 或：下午 8:34 小璃 好
+    // E. 寬鬆格式：時間 + 名字 + 內容
+    // 例如：
+    // 09:10 阿晨 早安
+    // 8:05 PM John Hello
     const looseLineMatch = row.match(
-      /^((?:上午|下午)?\s*\d{1,2}:\d{2})\s+([^\s:：]+)\s+(.+)$/
+      /^((?:上午|下午|中午|凌晨|AM|PM|am|pm)?\s*\d{1,2}:\d{2}|\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)?)\s+([^\s:：]+)\s+(.+)$/
     );
 
     if (bracketMatch) {
@@ -472,9 +490,15 @@ function parseLineChat(rawText) {
       continue;
     }
 
-    // 只要像日期列就先收日期，不再限制長度
-    if (dateMatch && !tabbedMatch && !bracketMatch && !inlineMatch) {
-      currentDate = dateMatch[1];
+    if (englishDateMatch) {
+      currentDate = englishDateMatch[2];
+      currentMessage = null;
+      continue;
+    }
+
+    if (numericDateMatch && !tabbedMatch && !bracketMatch && !inlineMatch) {
+      currentDate = numericDateMatch[1];
+      currentMessage = null;
       continue;
     }
 
@@ -494,24 +518,20 @@ function parseLineChat(rawText) {
       const speaker = looseLineMatch[2].trim();
       const content = looseLineMatch[3].trim();
 
-      // 避免整句被誤抓成名字 (由 30 縮減至 20)
       if (speaker.length <= 20 && content.length > 0) {
-        // 額外保險：避免寬鬆匹配誤吃系統資訊
-        if (!/^(通話時間|收回了訊息|加入|離開|已取消|已讀)$/.test(content)) {
-          const message = buildMessage(
-            currentDate,
-            looseLineMatch[1],
-            speaker,
-            content
-          );
-          messages.push(message);
-          currentMessage = message;
-          continue;
-        }
+        const message = buildMessage(
+          currentDate,
+          looseLineMatch[1],
+          speaker,
+          content
+        );
+        messages.push(message);
+        currentMessage = message;
+        continue;
       }
     }
 
-    // 其餘情況當續行
+    // 續行訊息
     if (currentMessage) {
       currentMessage.content += ` ${row}`;
       currentMessage.wordCount = countWords(currentMessage.content);
@@ -642,6 +662,7 @@ function selectTopTwoSpeakers(messages) {
   const { messages: normalizedMessages, counts } = consolidateSpeakers(messages);
 
   const sorted = Object.keys(counts).sort((a, b) => counts[b] - counts[a]);
+  console.log("raw speakers found:", sorted, counts);
 
   if (sorted.length < 2) {
     throw new Error(`分析失敗：僅辨識到一位說話者 (${sorted[0] || "無"})。請確認檔案格式或視角是否正確。`);
@@ -659,17 +680,31 @@ function selectTopTwoSpeakers(messages) {
 }
 
 function normalizeDate(dateText) {
-  const [year, month, day] = dateText.replace(/[./]/g, "-").split("-");
-  return [year, month.padStart(2, "0"), day.padStart(2, "0")].join("-");
+  const raw = String(dateText).trim().replace(/[.]/g, "/").replace(/-/g, "/");
+  const parts = raw.split("/");
+
+  if (parts.length !== 3) return "1970-01-01";
+
+  // yyyy/mm/dd
+  if (parts[0].length === 4) {
+    const [year, month, day] = parts;
+    return [year, month.padStart(2, "0"), day.padStart(2, "0")].join("-");
+  }
+
+  // mm/dd/yyyy （英文 LINE 匯出常見）
+  if (parts[2].length === 4) {
+    const [month, day, year] = parts;
+    return [year, month.padStart(2, "0"), day.padStart(2, "0")].join("-");
+  }
+
+  return "1970-01-01";
 }
 
 function normalizeLineTime(timeText) {
-  const raw = String(timeText).trim();
-  // 處理可能的「下午12:03」(無空格) 情況
-  const cleanRaw = raw.replace(/\s+/g, "");
+  const raw = String(timeText).trim().replace(/\s+/g, "");
 
-  // 下午 8:34 / 上午 9:05 / 中午 / 凌晨
-  const zhMeridiemMatch = cleanRaw.match(/^(上午|下午|中午|凌晨)(\d{1,2}):(\d{2})$/);
+  // 中文時段
+  const zhMeridiemMatch = raw.match(/^(上午|下午|中午|凌晨)(\d{1,2}):(\d{2})$/);
   if (zhMeridiemMatch) {
     const meridiem = zhMeridiemMatch[1];
     let hour = Number(zhMeridiemMatch[2]);
@@ -684,43 +719,61 @@ function normalizeLineTime(timeText) {
     return `${String(hour).padStart(2, "0")}:${minute}`;
   }
 
-  // AM 8:34 / PM 8:34
-  const enMeridiemMatch = cleanRaw.match(/^(AM|PM|am|pm)(\d{1,2}):(\d{2})$/);
-  if (enMeridiemMatch) {
-    const meridiem = enMeridiemMatch[1].toLowerCase();
-    let hour = Number(enMeridiemMatch[2]);
-    const minute = enMeridiemMatch[3];
+  // AM8:34 / PM8:34
+  let match = raw.match(/^(AM|PM|am|pm)(\d{1,2}):(\d{2})$/);
+  if (match) {
+    const meridiem = match[1].toLowerCase();
+    let hour = Number(match[2]);
+    const minute = match[3];
 
     if (meridiem === "am") {
       if (hour === 12) hour = 0;
-    } else if (meridiem === "pm") {
+    } else {
       if (hour !== 12) hour += 12;
     }
 
     return `${String(hour).padStart(2, "0")}:${minute}`;
   }
 
-  // 純 8:34 / 08:34
-  const plainMatch = cleanRaw.match(/^(\d{1,2}):(\d{2})$/);
-  if (plainMatch) {
-    return `${plainMatch[1].padStart(2, "0")}:${plainMatch[2]}`;
+  // 8:34AM / 8:34PM
+  match = raw.match(/^(\d{1,2}):(\d{2})(AM|PM|am|pm)$/);
+  if (match) {
+    let hour = Number(match[1]);
+    const minute = match[2];
+    const meridiem = match[3].toLowerCase();
+
+    if (meridiem === "am") {
+      if (hour === 12) hour = 0;
+    } else {
+      if (hour !== 12) hour += 12;
+    }
+
+    return `${String(hour).padStart(2, "0")}:${minute}`;
+  }
+
+  // 純時間
+  match = raw.match(/^(\d{1,2}):(\d{2})$/);
+  if (match) {
+    return `${match[1].padStart(2, "0")}:${match[2]}`;
   }
 
   return "00:00";
 }
 
 function countWords(content) {
-  const mediaMatches = content.match(/\[照片\]|\[影片\]|\[語音\]|\[貼圖\]/g) || [];
+  const mediaRegex = /\[(照片|影片|語音|貼圖|圖片|位置資訊|photo|video|voice message|sticker|picture|location)\]/gi;
+
+  const mediaMatches = content.match(mediaRegex) || [];
   const mediaWeight = mediaMatches.length * 15;
 
-  const textContent = content.replace(/\[照片\]|\[影片\]|\[語音\]|\[貼圖\]/g, "").replace(/\s+/g, " ").trim();
+  const textContent = content
+    .replace(mediaRegex, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
   const tokens = textContent.match(/[\u4e00-\u9fff]|[A-Za-z0-9_]+/g);
   let textWeight = tokens ? tokens.length : (textContent.length > 0 ? 1 : 0);
 
-  // 【惡魔修復：反字數溢出】
-  // 對於超過 100 字的長文，採用對數成長。
-  // 這確保了「100 字」與「1000 字」都代表了「極高投入」，
-  // 但後者不會因為字數過多而讓前者顯得像「敷衍」(離群值保護)。
   if (textWeight > 100) {
     textWeight = 100 + Math.log10(textWeight - 99) * 20;
   }
@@ -730,8 +783,32 @@ function countWords(content) {
 
 function isSystemMessage(content) {
   const trimmed = content.trim();
-  return /^(收回了訊息|通話時間|加入了群組|離開了群組|已取消)$/.test(trimmed) ||
-    /^\[(貼圖|照片|圖片|影片|語音訊息?|位置資訊)\]$/.test(trimmed);
+
+  // 中文 / 英文系統訊息
+  if (/^(收回了訊息|已取消|you unsent a message\.?)$/i.test(trimmed)) {
+    return true;
+  }
+
+  // 純媒體占位
+  if (/^\[(貼圖|照片|圖片|影片|語音訊息?|位置資訊|sticker|photo|picture|video|voice message|location)\]$/i.test(trimmed)) {
+    return true;
+  }
+
+  // 通話相關
+  if (/^☎\s*(call time|missed call|canceled call|no answer)/i.test(trimmed)) {
+    return true;
+  }
+
+  // 群組相關
+  if (/^(加入了群組|離開了群組)$/i.test(trimmed)) {
+    return true;
+  }
+
+  if (/(joined the group|left the group)$/i.test(trimmed)) {
+    return true;
+  }
+
+  return false;
 }
 
 function analyzeMessages(messages, subjectName = null) {
@@ -2081,11 +2158,12 @@ function classifyRelationship(input) {
   function isQuestion(content) {
     const normalized = normalizeSemanticText(content);
     const tokens = semanticTokens(content);
+
     if (!normalized || normalized.startsWith("http")) {
       return false;
     }
 
-    if (/(\?|？|嗎|要不要|有沒有|會不會|可不可以|能不能)/.test(content)) {
+    if (/(\?|？|嗎|要不要|有沒有|會不會|可不可以|能不能|\bdo you\b|\bare you\b|\bcan you\b|\bcould you\b|\bwould you\b|\bwill you\b|\bdid you\b|\bhave you\b|\bwhat\b|\bwhy\b|\bwhen\b|\bwhere\b|\bhow\b)/i.test(content)) {
       return tokens.length >= 2;
     }
 
@@ -2101,7 +2179,7 @@ function classifyRelationship(input) {
     if (requestTokens.length < 3) return false;
     if (!responseText || !responseTokens.length) return true;
 
-    if (/(可以|不行|有|沒有|好啊|不要|要|會|不會|今天不行|晚點|等等|明天|在忙|到了|還沒|醒了|睡著了|知道了|收到)/.test(responseText)) return false;
+    if (/(可以|不行|有|沒有|好啊|不要|要|會|不會|今天不行|晚點|等等|明天|在忙|到了|還沒|醒了|睡著了|知道了|收到|yes|no|maybe|later|tomorrow|busy|arrived|got it|received|sure)/.test(responseText)) return false;
 
     if (responseTokens.length <= 3) return isLowSignalReply(response.content);
 
@@ -2140,11 +2218,20 @@ function classifyRelationship(input) {
     const normalized = normalizeSemanticText(content);
     if (!normalized) return true;
 
-    const fillers = new Set(["嗯", "恩", "喔", "哦", "好", "對", "對啊", "是喔", "有哇", "真假", "原來", "還好", "還好欸", "哈哈", "哈哈哈", "lol", "ok", "okay", "摁", "欸"]);
-    const meaningfulShortReplies = new Set(["可以", "不行", "有", "沒有", "在忙", "等等", "晚點", "明天", "今天不行", "等一下", "好啊", "不要", "要", "會", "不會", "到了", "快到了", "還沒", "醒了", "睡著了", "知道了", "收到", "下班了", "回家了"]);
+    const fillers = new Set([
+      "嗯","恩","喔","哦","好","對","對啊","是喔","有哇","真假","原來","還好","還好欸",
+      "哈哈","哈哈哈","lol","ok","okay","k","hmm","uhh","yeah","yep","nope"
+    ]);
+
+    const meaningfulShortReplies = new Set([
+      "可以","不行","有","沒有","在忙","等等","晚點","明天","今天不行","等一下","好啊",
+      "不要","要","會","不會","到了","快到了","還沒","醒了","睡著了","知道了","收到",
+      "下班了","回家了",
+      "yes","no","maybe","later","tomorrow","not today","busy","on my way","arrived",
+      "not yet","got it","received","sure","cant","can't","can","cannot"
+    ]);
 
     if (meaningfulShortReplies.has(normalized)) return false;
-
     return fillers.has(normalized);
   }
 
