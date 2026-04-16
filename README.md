@@ -3,10 +3,9 @@
 > **「以數據量化感性，以拓撲分析回憶。」**
 
 ![Version](https://img.shields.io/badge/version-1.0.0--Final-accent)
-![Industrial Grade](https://img.shields.io/badge/Audit-17--Layers%20Passed-success)
 ![Privacy](https://img.shields.io/badge/Privacy-Local%20Only-blue)
 
-SoulSync 是一款基於互動拓撲（Interaction Topology）的關係診斷工具。它能透過解析 LINE 的聊天紀錄，利用 17 層個性化演算法，鑑定出你在這段關係中扮演的「犬種人格」。
+SoulSync 是一款基於互動拓撲（Interaction Topology）的關係診斷工具。它能透過解析 LINE 的聊天紀錄，利用非對稱權力演算法，鑑定出你在這段關係中扮演的「犬種人格」。
 
 ---
 
@@ -27,10 +26,7 @@ SoulSync 是一款基於互動拓撲（Interaction Topology）的關係診斷工
 
 ## 🛠️ 技術底層
 
-本專案通過了 **Omega-27 工業級架構認證** 與 **17 層代碼質量核驗**，具備極高的健壯性與數據準確度。
-
-- **指標**：Latency (延遲), Payload (內容投入), Jitter (忽冷忽热), Penalty (危險訊號)。
-- **引擎**：核心判定逻辑基於 `computeDogSignals` 非對稱地位演算法。
+本專案具備極高的健壯性與數據準確度，核心判定邏輯基於 `computeDogSignals` 非對稱地位演算法。
 
 ---
 
