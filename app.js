@@ -192,9 +192,11 @@ const DOG_CHARACTER_META = {
 const appState = {
   file: null,
   rawText: "",
+  parsedMessages: [], // 儲存拓補處理後的穩定訊息
+  activeSpeakers: [],  // 儲存最終選定的二人名單
   lastResult: null,
   subjectSpeaker: null,
-  isDemoMode: false, // 狀態位元：標記目前是否處於演示數據模式
+  isDemoMode: false,
 };
 
 
@@ -354,15 +356,23 @@ async function startV3AnalysisFlow() {
       for (let j = i + 1; j < speakerKeys.length; j++) {
         const longName = speakerKeys[i];
         const shortName = speakerKeys[j];
-        if (longName && shortName && longName.includes(shortName)) {
-          if (finalSpeakerCounts[shortName]) {
-            finalSpeakerCounts[longName] += finalSpeakerCounts[shortName];
-            delete finalSpeakerCounts[shortName];
-            // 同步更新訊息對象
-            messages.forEach(m => {
-              if (m.speaker.trim() === shortName) m.speaker = longName;
-            });
-          }
+
+        const shortCount = finalSpeakerCounts[shortName] || 0;
+        const longCount = finalSpeakerCounts[longName] || 0;
+
+        // 【安全合併條件】：長包含短、短名字長度至少 2、且短名字訊息量佔比極低 (避免吃掉活躍人物)
+        const safeToMerge =
+          longName.includes(shortName) &&
+          shortName.length >= 2 &&
+          shortCount <= Math.max(3, longCount * 0.2);
+
+        if (safeToMerge && finalSpeakerCounts[shortName]) {
+          finalSpeakerCounts[longName] += finalSpeakerCounts[shortName];
+          delete finalSpeakerCounts[shortName];
+          // 同步更新訊息對象
+          messages.forEach(m => {
+            if (m.speaker.trim() === shortName) m.speaker = longName;
+          });
         }
       }
     }
@@ -374,15 +384,19 @@ async function startV3AnalysisFlow() {
     console.log("consolidated speakers:", sortedSpeakers);
 
     if (sortedSpeakers.length < 2) {
-      throw new Error(`解析失敗：只辨識到一位說話者 (${sortedSpeakers[0] || "無"})，請確認匯格式。`);
+      throw new Error(`解析失敗：僅辨識到一位說話者 (${sortedSpeakers[0] || "無"})，請確認匯出檔格式。`);
     }
 
     // 取對話量最高的前兩位 (自動排除群組雜訊或 parser 誤判的零星名字)
     const speakers = sortedSpeakers.slice(0, 2);
 
     if (sortedSpeakers.length > 2) {
-      console.warn(`偵測到 ${sortedSpeakers.length} 位說話者，系統已自動選取主要二人：${speakers.join(" & ")}`);
+      console.warn(`偵測到 ${sortedSpeakers.length} 位說話者，系統已選取主要二人：${speakers.join(" & ")}`);
     }
+
+    // 將整理後的數據存入全域狀態，供後續分析階段直接調用
+    appState.activeSpeakers = speakers;
+    appState.parsedMessages = messages.filter(m => speakers.includes(m.speaker));
 
     ui.identityPicker.classList.remove("hidden");
     ui.speakerButtons.innerHTML = "";
@@ -395,8 +409,8 @@ async function startV3AnalysisFlow() {
     });
 
     ui.statusBox.textContent = appState.isDemoMode
-      ? "DEMO 模式載入成功！請點擊下方你的暱稱以開始判定。"
-      : "檔案解析成功！請選擇你的暱稱以開始鑑定。";
+      ? "DEMO 模式載入成功！請點擊您的暱稱以開始判定。"
+      : "檔案解析成功！請點擊您的暱稱以開始鑑定。";
 
     ui.emptyState.innerHTML = `<p>已讀取到 <strong>${speakers.join(" & ")}</strong> 的回憶。<br>請在上方點擊你的名字，系統將以你的視角進行拓補分析。</p>`;
 
@@ -416,12 +430,13 @@ async function runAnalysis(subjectName) {
 
     await fakeComputeDelay();
 
-    const messages = parseLineChat(appState.rawText);
+    // 直接使用預先處理好的合併訊息，避免重複解析導致的名字不一致問題
+    const messages = appState.parsedMessages;
     const result = analyzeMessages(messages, subjectName);
     appState.lastResult = result;
 
     renderResult(result);
-    ui.statusBox.textContent = "分析完成。你現在可以下載或分享限動圖。";
+    ui.statusBox.textContent = "分析完成。您現在可以下載或分享限動圖。";
   } catch (error) {
     ui.statusBox.textContent = `分析失敗：${error.message}`;
   } finally {
@@ -520,17 +535,20 @@ function parseLineChat(rawText) {
       const speaker = looseLineMatch[2].trim();
       const content = looseLineMatch[3].trim();
 
-      // 避免整句被誤抓成名字
-      if (speaker.length <= 30 && content.length > 0) {
-        const message = buildMessage(
-          currentDate,
-          looseLineMatch[1],
-          speaker,
-          content
-        );
-        messages.push(message);
-        currentMessage = message;
-        continue;
+      // 避免整句被誤抓成名字 (由 30 縮減至 20)
+      if (speaker.length <= 20 && content.length > 0) {
+        // 額外保險：避免寬鬆匹配誤吃系統資訊
+        if (!/^(通話時間|收回了訊息|加入|離開|已取消|已讀)$/.test(content)) {
+          const message = buildMessage(
+            currentDate,
+            looseLineMatch[1],
+            speaker,
+            content
+          );
+          messages.push(message);
+          currentMessage = message;
+          continue;
+        }
       }
     }
 
@@ -577,18 +595,20 @@ function normalizeDate(dateText) {
 }
 
 function normalizeLineTime(timeText) {
-  const raw = String(timeText).trim().replace(/\s+/g, "");
+  const raw = String(timeText).trim();
+  // 處理可能的「下午12:03」(無空格) 情況
+  const cleanRaw = raw.replace(/\s+/g, "");
 
-  // 下午 8:34 / 上午 9:05
-  const zhMeridiemMatch = raw.match(/^(上午|下午)(\d{1,2}):(\d{2})$/);
+  // 下午 8:34 / 上午 9:05 / 中午 / 凌晨
+  const zhMeridiemMatch = cleanRaw.match(/^(上午|下午|中午|凌晨)(\d{1,2}):(\d{2})$/);
   if (zhMeridiemMatch) {
     const meridiem = zhMeridiemMatch[1];
     let hour = Number(zhMeridiemMatch[2]);
     const minute = zhMeridiemMatch[3];
 
-    if (meridiem === "上午") {
+    if (meridiem === "上午" || meridiem === "凌晨") {
       if (hour === 12) hour = 0;
-    } else if (meridiem === "下午") {
+    } else if (meridiem === "下午" || meridiem === "中午") {
       if (hour !== 12) hour += 12;
     }
 
@@ -596,7 +616,7 @@ function normalizeLineTime(timeText) {
   }
 
   // AM 8:34 / PM 8:34
-  const enMeridiemMatch = raw.match(/^(AM|PM|am|pm)(\d{1,2}):(\d{2})$/);
+  const enMeridiemMatch = cleanRaw.match(/^(AM|PM|am|pm)(\d{1,2}):(\d{2})$/);
   if (enMeridiemMatch) {
     const meridiem = enMeridiemMatch[1].toLowerCase();
     let hour = Number(enMeridiemMatch[2]);
@@ -612,12 +632,11 @@ function normalizeLineTime(timeText) {
   }
 
   // 純 8:34 / 08:34
-  const plainMatch = raw.match(/^(\d{1,2}):(\d{2})$/);
+  const plainMatch = cleanRaw.match(/^(\d{1,2}):(\d{2})$/);
   if (plainMatch) {
     return `${plainMatch[1].padStart(2, "0")}:${plainMatch[2]}`;
   }
 
-  // fallback，避免整個炸掉
   return "00:00";
 }
 
@@ -810,7 +829,7 @@ function analyzeMessages(messages, subjectName = null) {
   // 12 種犬種判定 (回傳評分物件以計算 Mix)
   const myScores = classifyDogType(inputForClassification, povSpeaker, cpSignals.powerScore);
   const dogType = resolvePrimaryType(myScores, inputForClassification);
-  const personalityMix = calculatePersonalityMix(myScores);
+  const personalityMix = calculatePersonalityMix(myScores, dogType);
 
   const cpScores = classifyDogType(inputForClassification, counterpartName, mySignals.powerScore);
   const counterpartType = resolvePrimaryType(cpScores, inputForClassification);
@@ -1497,8 +1516,13 @@ function fallbackStableType(sorted, input) {
 
   return "貴賓狗型";
 }
-  function calculatePersonalityMix(scores) {
+  function calculatePersonalityMix(scores, primaryType = null) {
     const personalityScores = { ...scores };
+
+    // 【視覺一致化】：為主類型注入保底權重，確保混血第一順位與主判定一致
+    if (primaryType && personalityScores[primaryType] != null) {
+      personalityScores[primaryType] += 12;
+    }
 
     const total = Object.values(personalityScores).reduce((a, b) => a + b, 0);
     if (total === 0) return [];
