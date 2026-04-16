@@ -194,6 +194,8 @@ const appState = {
   rawText: "",
   parsedMessages: [], // 儲存拓補處理後的穩定訊息
   activeSpeakers: [],  // 儲存最終選定的二人名單
+  activeSpeakerDisplays: [],
+  canonicalDisplayMap: {},
   lastResult: null,
   subjectSpeaker: null,
   isDemoMode: false,
@@ -572,11 +574,11 @@ function parseLineChat(rawText) {
 }
 
 function isValidIsoDate(isoDate) {
-  return /^\d{4}-\d{2}-\d{2}$/.test(isoDate) && isoDate !== "1970-01-01";
+  return typeof isoDate === "string" && /^\d{4}-\d{2}-\d{2}$/.test(isoDate);
 }
 
 function isValidTimeString(timeText) {
-  return /^\d{2}:\d{2}$/.test(timeText) && timeText !== "00:00";
+  return typeof timeText === "string" && /^\d{2}:\d{2}$/.test(timeText);
 }
 
 function buildMessage(dateText, timeText, speaker, content) {
@@ -736,7 +738,7 @@ function normalizeDate(dateText) {
   const raw = String(dateText).trim().replace(/[.]/g, "/").replace(/-/g, "/");
   const parts = raw.split("/");
 
-  if (parts.length !== 3) return "1970-01-01";
+  if (parts.length !== 3) return null;
 
   // yyyy/mm/dd
   if (parts[0].length === 4) {
@@ -750,22 +752,22 @@ function normalizeDate(dateText) {
     return [year, month.padStart(2, "0"), day.padStart(2, "0")].join("-");
   }
 
-  return "1970-01-01";
+  return null;
 }
 
 function normalizeLineTime(timeText) {
   const raw = String(timeText).trim().replace(/\s+/g, "");
 
   // 中文時段
-  const zhMeridiemMatch = raw.match(/^(上午|下午|中午|凌晨)(\d{1,2}):(\d{2})$/);
-  if (zhMeridiemMatch) {
-    const meridiem = zhMeridiemMatch[1];
-    let hour = Number(zhMeridiemMatch[2]);
-    const minute = zhMeridiemMatch[3];
+  let match = raw.match(/^(上午|下午|中午|凌晨)(\d{1,2}):(\d{2})$/);
+  if (match) {
+    const meridiem = match[1];
+    let hour = Number(match[2]);
+    const minute = match[3];
 
     if (meridiem === "上午" || meridiem === "凌晨") {
       if (hour === 12) hour = 0;
-    } else if (meridiem === "下午" || meridiem === "中午") {
+    } else {
       if (hour !== 12) hour += 12;
     }
 
@@ -773,7 +775,7 @@ function normalizeLineTime(timeText) {
   }
 
   // AM8:34 / PM8:34
-  let match = raw.match(/^(AM|PM|am|pm)(\d{1,2}):(\d{2})$/);
+  match = raw.match(/^(AM|PM|am|pm)(\d{1,2}):(\d{2})$/);
   if (match) {
     const meridiem = match[1].toLowerCase();
     let hour = Number(match[2]);
@@ -810,7 +812,7 @@ function normalizeLineTime(timeText) {
     return `${match[1].padStart(2, "0")}:${match[2]}`;
   }
 
-  return "00:00";
+  return null;
 }
 
 function countWords(content) {
@@ -1038,9 +1040,12 @@ function analyzeMessages(messages, subjectName = null) {
   const isPursuer = myPower < cpPower;
 
   const participantsArray = [povSpeaker, counterpartName];
+  const displayMap = appState.canonicalDisplayMap || {};
+  const participantDisplays = participantsArray.map(k => displayMap[k] || k);
 
   const metadata = {
     participants: participantsArray,
+    participantDisplays,
     messageCount: messages.length,
     responsePairCount: responsePairs.length,
     baselineMRTMinutes: round(baselineMrt),
@@ -1791,9 +1796,12 @@ function classifyRelationship(input) {
 
   function buildVerdict({ dogType, relationshipModel, finalSyncRate, stabilityFlag, penaltyTotal, metrics, subjectSpeaker }) {
     const isMaster = ["高冷黑貓型", "佛系和尚狗型", "狼系主宰型"].includes(dogType);
-    const counterpart = metrics && metrics.initiationBias
+    const keyCounterpart = metrics && metrics.initiationBias
       ? Object.keys(metrics.initiationBias).find(name => name !== subjectSpeaker) || "對方"
       : "對方";
+
+    const displayMap = appState.canonicalDisplayMap || {};
+    const counterpart = displayMap[keyCounterpart] || keyCounterpart;
 
     let targetDogForCounterpart = "流浪狗";
     if (relationshipModel === "雙向同步") targetDogForCounterpart = "邊境牧羊犬";
@@ -1987,7 +1995,10 @@ function classifyRelationship(input) {
       );
       if (ui.penaltyMetric) ui.penaltyMetric.textContent = humanizePenalty(metadata.penalties.total);
 
-      if (ui.participantsLabel) ui.participantsLabel.textContent = metadata.participants.join(" ↔ ");
+      // 使用顯示名
+      const displayList = metadata.participantDisplays || metadata.participants;
+      if (ui.participantsLabel) ui.participantsLabel.textContent = displayList.join(" ↔ ");
+
       if (ui.stabilityLabel) ui.stabilityLabel.textContent = metadata.stabilityFlag;
       if (ui.confidenceLabel) ui.confidenceLabel.textContent = `${metadata.confidence.label} (${metadata.confidence.value}%)`;
       if (ui.driversLabel) ui.driversLabel.textContent = metadata.impactDrivers.join(" / ");
@@ -2003,9 +2014,9 @@ function classifyRelationship(input) {
         counterpartCharacter: metadata.counterpartCharacter,
         relationshipModel: metadata.relationshipModel,
         verdict,
-        participants: metadata.participants.join(" × "),
+        participants: displayList.join(" × "),
         stabilityFlag: metadata.stabilityFlag,
-        personalityMix: metadata.personalityMix, // 傳入比例數據
+        personalityMix: metadata.personalityMix,
       });
 
       if (ui.storyPreview) ui.storyPreview.src = previewUrl;
@@ -2232,7 +2243,7 @@ function classifyRelationship(input) {
     if (requestTokens.length < 3) return false;
     if (!responseText || !responseTokens.length) return true;
 
-    if (/(可以|不行|有|沒有|好啊|不要|要|會|不會|今天不行|晚點|等等|明天|在忙|到了|還沒|醒了|睡著了|知道了|收到|yes|no|maybe|later|tomorrow|busy|arrived|got it|received|sure)/.test(responseText)) return false;
+    if (/(今天|明天|晚點|等等|現在|剛剛|下班|到家|吃飯|開會|忙完|回家|today|tomorrow|later|now|just now|after work|home|at home|eating|in a meeting|busy|done|finished|yes|no|maybe|arrived|got it|received|sure)/i.test(responseText)) return false;
 
     if (responseTokens.length <= 3) return isLowSignalReply(response.content);
 
