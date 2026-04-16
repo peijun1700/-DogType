@@ -683,11 +683,11 @@ function analyzeMessages(messages, subjectName = null) {
 
   // 12 種犬種判定 (回傳評分物件以計算 Mix)
   const myScores = classifyDogType(inputForClassification, povSpeaker, cpSignals.powerScore);
-  const dogType = Object.entries(myScores).sort((a, b) => b[1] - a[1])[0][0];
+  const dogType = resolvePrimaryType(myScores, inputForClassification);
   const personalityMix = calculatePersonalityMix(myScores);
 
   const cpScores = classifyDogType(inputForClassification, counterpartName, mySignals.powerScore);
-  const counterpartType = Object.entries(cpScores).sort((a, b) => b[1] - a[1])[0][0];
+  const counterpartType = resolvePrimaryType(cpScores, inputForClassification);
 
   const myPower = mySignals.powerScore;
   const cpPower = cpSignals.powerScore;
@@ -1041,25 +1041,35 @@ function classifyDogType(input, targetSpeaker = null, counterpartPower = 0) {
   };
 
   if (!s.isPursuer && s.isHighPosition) {
-    // 黑貓：高位、冷、被動、低輸出
-    if (s.isPassive && s.isLowOutput) {
-      masterScores["高冷黑貓型"] += 62;
+    // 黑貓：要有冷感，不只是安靜
+    if (
+      s.isPassive &&
+      s.isLowOutput &&
+      input.avgPayloadScore < 0.62 &&
+      input.stabilityFlag === "STABLE"
+    ) {
+      masterScores["高冷黑貓型"] += 48;
     }
 
-    // 和尚：高位、被動、低輸出、穩定、不亂，且不是秒回監控型
-    if (s.isPassive && s.isLowOutput && s.latencyMid && !s.chaotic) {
-      masterScores["佛系和尚狗型"] += 74;
+    // 和尚：穩、低輸出、不亂、不爭
+    if (
+      s.isPassive &&
+      s.isLowOutput &&
+      !s.chaotic &&
+      input.stabilityFlag === "STABLE" &&
+      input.doublePingPenalty === 0
+    ) {
+      masterScores["佛系和尚狗型"] += 64;
     }
 
-    // 狼：高壓迫主導
+    // 狼：真的高壓主導才進
     if (s.powerScore > 88 || (s.isActive && s.powerScore > 62)) {
       masterScores["狼系主宰型"] += 84;
     }
   }
 
-  const topMaster = Object.entries(masterScores).sort((a, b) => b[1] - a[1])[0];
-  if (topMaster[1] >= 74) {
-    return { [topMaster[0]]: 100 };
+  for (const [name, value] of Object.entries(masterScores)) {
+    scores[name] += value;
   }
 
   // -------------------------
@@ -1119,8 +1129,14 @@ function classifyDogType(input, targetSpeaker = null, counterpartPower = 0) {
     scores["柴犬型"] += 28;
   }
 
-  if (input.avgLatencyScore > 0.92 && s.isHighOutput) {
-    scores["警犬型"] += 36;
+  if (
+    input.avgLatencyScore > 0.92 &&
+    s.isHighOutput &&
+    input.avgPayloadScore > 0.72 &&
+    input.doublePingPenalty <= 3 &&
+    !input.anxietySignal
+  ) {
+    scores["警犬型"] += 28;
   }
 
   // -------------------------
@@ -1128,9 +1144,9 @@ function classifyDogType(input, targetSpeaker = null, counterpartPower = 0) {
   // -------------------------
   if (s.isPursuer) {
     // 流浪狗：焦慮追逐、反覆 retry
-    if (input.doublePingPenalty >= 15) scores["流浪狗型"] += 38;
-    if (input.anxietySignal) scores["流浪狗型"] += 24;
-    if (input.syncRate < 55) scores["流浪狗型"] += 18;
+    if (input.doublePingPenalty >= 15) scores["流浪狗型"] += 28;
+    if (input.anxietySignal && input.syncRate < 60) scores["流浪狗型"] += 16;
+    if (input.syncRate < 50) scores["流浪狗型"] += 10;
 
     // 吉娃娃：短促焦躁、高頻抖動、內容又少
     if (input.doublePingPenalty >= 12 && input.avgPayloadScore < 0.45) {
@@ -1174,10 +1190,15 @@ function classifyDogType(input, targetSpeaker = null, counterpartPower = 0) {
     scores["哈比小狗型"] = 0;
     scores["吉娃娃型"] = 0;
 
-    // 冷且低輸出的人，不該被亂判成哈士奇
-    if (s.isPassive && s.isLowOutput && !input.anxietySignal) {
-      scores["哈士奇型"] = Math.max(0, scores["哈士奇型"] - 26);
-      scores["高冷黑貓型"] += 18;
+    // 只有在真的很冷感且穩定時才補黑貓，不偷長胖
+    if (
+      !s.isPursuer &&
+      s.isPassive &&
+      s.isLowOutput &&
+      input.avgPayloadScore < 0.58 &&
+      input.stabilityFlag === "STABLE"
+    ) {
+      scores["高冷黑貓型"] += 12;
     }
 
     // 穩定又冷的人再往和尚補
@@ -1211,12 +1232,21 @@ function classifyDogType(input, targetSpeaker = null, counterpartPower = 0) {
   // -------------------------
   // G. 細補強
   // -------------------------
-  if (!s.isPursuer && s.isPassive && s.isLowOutput) {
-    scores["高冷黑貓型"] += 10;
-  }
-
   if (s.nearZombie) {
     scores["殭屍狗型"] += 16;
+  }
+
+  // 中間角色引流：讓分布自然變多樣
+  if (input.avgPayloadScore > 0.72 && input.doublePingPenalty === 0) {
+    scores["貴賓狗型"] += 8;
+  }
+
+  if (input.avgLatencyScore < 0.45 && input.stabilityFlag === "STABLE") {
+    scores["柴犬型"] += 8;
+  }
+
+  if (model === "單向輸出" && s.isPursuer && input.avgPayloadScore > 0.55) {
+    scores["黃金獵犬型"] += 8;
   }
 
   // 若殭屍已經夠明顯，就壓掉哈比與黃金的浪漫濾鏡
@@ -1226,6 +1256,145 @@ function classifyDogType(input, targetSpeaker = null, counterpartPower = 0) {
   }
 
   return scores;
+}
+
+const DRAMATIC_TYPES = new Set([
+  "高冷黑貓型",
+  "流浪狗型",
+  "警犬型",
+  "狼系主宰型",
+  "殭屍狗型",
+  "吉娃娃型",
+]);
+
+const STABLE_TYPES = new Set([
+  "佛系和尚狗型",
+  "柴犬型",
+  "黃金獵犬型",
+  "貴賓狗型",
+  "邊境牧羊犬型",
+  "哈比小狗型",
+  "哈士奇型",
+]);
+
+function resolvePrimaryType(scores, input) {
+  const sorted = Object.entries(scores).sort((a, b) => b[1] - a[1]);
+  const [topName, topScore] = sorted[0] || ["柴犬型", 0];
+  const [secondName, secondScore] = sorted[1] || ["柴犬型", 0];
+  const gap = topScore - secondScore;
+
+  // 1. 劇烈型角色需要更高領先幅度
+  if (DRAMATIC_TYPES.has(topName)) {
+    const dramaticGatePassed = passesDramaticGate(topName, topScore, gap, input);
+
+    if (!dramaticGatePassed) {
+      // 若第二名是穩定型，優先退回穩定型
+      if (STABLE_TYPES.has(secondName)) {
+        return secondName;
+      }
+
+      // 否則退回較保守的 fallback
+      return fallbackStableType(sorted, input);
+    }
+  }
+
+  // 2. 黑貓 vs 和尚 特別仲裁
+  if (
+    (topName === "高冷黑貓型" && secondName === "佛系和尚狗型") ||
+    (topName === "佛系和尚狗型" && secondName === "高冷黑貓型")
+  ) {
+    if (Math.abs(topScore - secondScore) <= 10) {
+      // 沒有明顯冷感時，和尚優先
+      if (input.avgPayloadScore >= 0.5 && input.stabilityFlag === "STABLE") {
+        return "佛系和尚狗型";
+      }
+    }
+  }
+
+  // 3. 警犬保守化
+  if (topName === "警犬型") {
+    const safeWatchdog =
+      input.avgLatencyScore > 0.92 &&
+      input.avgPayloadScore > 0.72 &&
+      input.doublePingPenalty <= 3 &&
+      !input.anxietySignal;
+
+    if (!safeWatchdog) {
+      if (secondName === "貴賓狗型" || secondName === "黃金獵犬型") {
+        return secondName;
+      }
+      return "貴賓狗型";
+    }
+  }
+
+  return topName;
+}
+
+function passesDramaticGate(type, topScore, gap, input) {
+  switch (type) {
+    case "高冷黑貓型":
+      return (
+        topScore >= 36 &&
+        gap >= 12 &&
+        input.avgPayloadScore < 0.62 &&
+        input.stabilityFlag === "STABLE"
+      );
+
+    case "流浪狗型":
+      return (
+        topScore >= 42 &&
+        gap >= 10 &&
+        (input.doublePingPenalty >= 12 ||
+          input.ghostingPenalty >= 3 ||
+          (input.syncRate < 50 && input.anxietySignal))
+      );
+
+    case "警犬型":
+      return (
+        topScore >= 40 &&
+        gap >= 10 &&
+        input.avgLatencyScore > 0.92 &&
+        input.avgPayloadScore > 0.72 &&
+        input.doublePingPenalty <= 3 &&
+        !input.anxietySignal
+      );
+
+    case "狼系主宰型":
+      return topScore >= 50 && gap >= 12;
+
+    case "殭屍狗型":
+      return (
+        topScore >= 45 &&
+        gap >= 10 &&
+        (input.ghostingPenalty >= 12 || input.syncRate < 20)
+      );
+
+    case "吉娃娃型":
+      return (
+        topScore >= 40 &&
+        gap >= 10 &&
+        input.doublePingPenalty >= 12 &&
+        input.avgPayloadScore < 0.45
+      );
+
+    default:
+      return true;
+  }
+}
+
+function fallbackStableType(sorted, input) {
+  const stableCandidate = sorted.find(([name]) => STABLE_TYPES.has(name));
+  if (stableCandidate) return stableCandidate[0];
+
+  if (input.stabilityFlag === "STABLE" && input.avgPayloadScore >= 0.5) {
+    return "佛系和尚狗型";
+  }
+
+  if (input.avgLatencyScore < 0.45) {
+    return "柴犬型";
+  }
+
+  return "貴賓狗型";
 }
   function calculatePersonalityMix(scores) {
     const personalityScores = { ...scores };

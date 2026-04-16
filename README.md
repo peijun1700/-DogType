@@ -36,7 +36,7 @@ SoulSync 是一款基於互動拓撲（Interaction Topology）的關係診斷工
 
 ## 🚀 快速開始
 
-1. 打開 [部署網址] (建議使用 Vercel 或 GitHub Pages)。
+1. 打開 [SoulSync 線上鑑定站](https://peijun1700.github.io/-DogType/)。
 2. 按照網頁中的教學，從 LINE 匯出 `.txt` 對話紀錄。
 3. 投餵檔案，選擇你的視角，開始鑑定！
 
