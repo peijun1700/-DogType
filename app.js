@@ -2253,7 +2253,6 @@ function classifyRelationship(input) {
 
     if (overlap.length > 0) return false;
 
-    if (/(今天|明天|晚點|等等|現在|剛剛|下班|到家|吃飯|開會|忙完|回家)/.test(responseText)) return false;
 
     return responseTokens.length <= 3 && isLowSignalReply(response.content);
   }
@@ -2331,10 +2330,20 @@ function classifyRelationship(input) {
   }
 
   function buildFallbackZombieResult(speakers, messageCount) {
-    const dogCharacter = DOG_CHARACTER_META["殭屍狗型"] || { accent: "#a9adb5", code: "NULL", accessory: "dead-signal", tagline: "連線已終止" };
+    const dogCharacter = DOG_CHARACTER_META["殭屍狗型"] || {
+      accent: "#a9adb5",
+      code: "NULL",
+      accessory: "dead-signal",
+      tagline: "連線已終止"
+    };
+
+    const displayMap = appState.canonicalDisplayMap || {};
+    const participantDisplays = speakers.map(k => displayMap[k] || k);
+
     return {
       metadata: {
         participants: speakers,
+        participantDisplays,
         messageCount: messageCount,
         responsePairCount: 0,
         baselineMRTMinutes: 999,
@@ -2356,9 +2365,8 @@ function classifyRelationship(input) {
           rawPacketLoss: 0,
         },
         finalSyncRate: 0,
-
         dogType: "殭屍狗型",
-        dogCharacter: dogCharacter,
+        dogCharacter,
         counterpartType: "殭屍狗型",
         counterpartCharacter: dogCharacter,
         relationshipModel: "斷線關係",
