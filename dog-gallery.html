@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="zh-Hant">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>SOUL-SYNC Dog Gallery</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700;900&family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500;700&display=swap"
+    rel="stylesheet" />
+  <link rel="stylesheet" href="./styles.css?v=2.0.0-PROD" />
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f9f8f6;
+      --bg-2: #fcfbf9;
+      --card: #ffffff;
+      --line: #e3dfda;
+      --ink: #2d2d2a;
+      --muted: #7a756e;
+      --accent: #d1a25c;
+      --accent-soft: #e8d1a4;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: "Noto Sans TC", sans-serif;
+      color: var(--ink);
+      background: linear-gradient(180deg, var(--bg-2) 0%, var(--bg) 100%);
+    }
+
+    .shell {
+      width: min(1280px, calc(100vw - 28px));
+      margin: 0 auto;
+      padding: 32px 0 48px;
+    }
+
+    .hero {
+      margin-bottom: 24px;
+    }
+
+    .eyebrow,
+    .meta {
+      font-family: "IBM Plex Mono", monospace;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      color: var(--muted);
+    }
+
+    .eyebrow {
+      font-size: 0.82rem;
+    }
+
+    h1 {
+      margin: 10px 0 12px;
+      font-size: clamp(2.1rem, 4vw, 4rem);
+      line-height: 1;
+    }
+
+    .hero p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.7;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 18px;
+    }
+
+    .breed-card {
+      padding: 18px;
+      border-radius: 28px;
+      background: var(--card);
+      border: 1px solid rgba(188, 201, 186, 0.9);
+      box-shadow:
+        0 18px 48px rgba(144, 160, 144, 0.14),
+        inset 1px 1px 0 rgba(255, 255, 255, 0.88);
+    }
+
+    .meta {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.72rem;
+    }
+
+    .meta strong {
+      color: var(--ink);
+      font-family: "Space Grotesk", sans-serif;
+      font-size: 0.92rem;
+    }
+
+    canvas {
+      width: 100%;
+      height: auto;
+      display: block;
+      margin-top: 12px;
+      border-radius: 24px;
+      border: 1px solid var(--line);
+      background: #f7fbf5;
+    }
+
+    .caption {
+      margin-top: 14px;
+    }
+
+    .caption h2 {
+      margin: 0 0 4px;
+      font-size: 1.2rem;
+    }
+
+    .caption p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.65;
+    }
+  </style>
+</head>
+
+<body>
+  <main class="shell">
+    <header class="hero">
+      <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+        <div>
+          <div class="eyebrow">SOUL-SYNC / DOG GALLERY</div>
+          <h1>全系列個性角色卡預覽</h1>
+        </div>
+        <a href="index.html" class="section-tag"
+          style="text-decoration: none; border-color: var(--accent); color: var(--accent); margin-top: 10px;">➜
+          回首頁鑑定</a>
+      </div>
+      <p>這一頁會渲染目前系統中所有的狗與貓性格角色。包含最新加入的哈士奇、吉娃娃以及靈魂主宰系列。</p>
+    </header>
+
+    <section id="gallery" class="grid"></section>
+  </main>
+
+  <script src="./app.js?v=2.0.0-PROD" defer></script>
+  <script>
+    (function () {
+      const gallery = document.querySelector("#gallery");
+      const requiredBreeds = ["NEKO", "ZEN", "ALPHA", "PUPPY", "SYNC", "MELLOW", "POLI", "LAGI", "STRAY", "WATCH", "NULL", "CHAOS", "YAPPI"];
+
+      function startRendering() {
+        const renderer = window.SoulSyncRenderer;
+        if (!renderer || !renderer.DOG_CHARACTER_META) {
+          setTimeout(startRendering, 100);
+          return;
+        }
+
+        const allMetaData = renderer.DOG_CHARACTER_META;
+
+        gallery.innerHTML = "";
+
+        // --- V2 性格標本與大師特區 (Masters & V2 Special) ---
+        const specialOrder = ["高冷黑貓型", "佛系和尚狗型", "狼系主宰型", "哈比小狗型"];
+
+        specialOrder.forEach((typeName, i) => {
+          const meta = allMetaData[typeName];
+          if (!meta) return;
+          const card = document.createElement("article");
+          card.className = "breed-card";
+          card.style.border = "2px solid #d1a25c88"; // 金色邊框標示
+
+          card.innerHTML = `
+              <div class="meta">
+                <span>LEGENDARY #0${i + 1}</span>
+                <strong>${meta.code}</strong>
+              </div>
+              <canvas width="1080" height="1920"></canvas>
+              <div class="caption">
+                <h2>${typeName}</h2>
+                <p>${meta.title}。${meta.tagline}</p>
+              </div>
+            `;
+          gallery.appendChild(card);
+
+          const canvas = card.querySelector("canvas");
+          renderer.renderDogCardToCanvas(canvas, renderer.createDogPreviewData(typeName, {
+            relationshipModel: i < 3 ? "靈魂主宰" : "極致同步",
+            syncRate: 98,
+            participants: "Master × Subject"
+          }));
+        });
+
+        // 渲染其餘 9 種品種
+        const dogEntries = Object.entries(allMetaData).filter(([name]) => !specialOrder.includes(name));
+        dogEntries.forEach(([dogType, meta], index) => {
+          const card = document.createElement("article");
+          card.className = "breed-card";
+
+          let tone = { relationshipModel: "核心樣本", syncRate: 75, stabilityFlag: "STABLE" };
+          if (meta.code === "STRAY") tone = { relationshipModel: "間歇性強化", syncRate: 52, stabilityFlag: "UNSTABLE" };
+          if (meta.code === "NULL") tone = { relationshipModel: "斷線關係", syncRate: 15, stabilityFlag: "UNSTABLE" };
+          if (meta.code === "CHAOS") tone = { relationshipModel: "混亂同步", syncRate: 88, stabilityFlag: "UNSTABLE" };
+          if (meta.code === "YAPPI") tone = { relationshipModel: "極端焦慮", syncRate: 35, stabilityFlag: "UNSTABLE" };
+
+          card.innerHTML = `
+              <div class="meta">
+                <span>BREED #0${index + 1}</span>
+                <strong>${meta.code}</strong>
+              </div>
+              <canvas width="1080" height="1920"></canvas>
+              <div class="caption">
+                <h2>${dogType}</h2>
+                <p>${meta.title}。${meta.tagline}</p>
+              </div>
+            `;
+          gallery.appendChild(card);
+
+          const canvas = card.querySelector("canvas");
+          renderer.renderDogCardToCanvas(canvas, renderer.createDogPreviewData(dogType, {
+            ...tone,
+            participants: "Gallery × Auditor"
+          }));
+        });
+
+        const foundCodes = Object.values(allMetaData).map(meta => meta.code);
+        const missing = requiredBreeds.filter(code => !foundCodes.includes(code));
+
+        if (missing.length === 0) {
+          console.log("✅ 驗收完成：12 塊金磚全數歸位，主宰系列（NEKO, ZEN, ALPHA）已確認存在。");
+        } else {
+          console.error("❌ 驗收失敗：遺漏磚塊：", missing);
+          const errorBanner = document.createElement("div");
+          errorBanner.style.color = "red";
+          errorBanner.style.padding = "20px";
+          errorBanner.textContent = "系統警告：偵測到建築遺漏！遺漏代號：" + missing.join(", ");
+          gallery.prepend(errorBanner);
+        }
+      }
+
+      startRendering();
+    })();
+  </script>
+</body>
+
+</html>

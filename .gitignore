@@ -1,0 +1,23 @@
+# OS 
+.DS_Store
+Thumbs.db
+
+# Development Scratch & Temp
+scratch/
+scratch.js
+scratch_patch.js
+run_temp.js
+build_test.js
+test_bug.js
+test_bug.py
+exhaustive_test.js
+red_team_test.js
+test_breeds.js
+
+# Planning & Task Artifacts
+implementation_plan.md
+task.md
+walkthrough.md
+
+# Logs
+*.log
