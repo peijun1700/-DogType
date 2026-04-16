@@ -1864,8 +1864,14 @@ function classifyRelationship(input) {
 
     // --- 【Phase 3.1 視覺硬化：垂直標籤排列】 ---
     if (personalityMix && personalityMix.length > 0) {
-      const startY = 170; // 下移 Y 軸，避免與標題重疊
+      const startY = 210;
       const rightMargin = 920;
+
+      // 小標題：混血傾向
+      ctx.textAlign = "right";
+      ctx.fillStyle = "#8a877f";
+      ctx.font = '700 22px "Noto Sans TC", sans-serif';
+      ctx.fillText("混血傾向", rightMargin, 176);
 
       // 嚴格限制 Top 3 排列
       personalityMix.slice(0, 3).forEach((item, i) => {
