@@ -400,6 +400,7 @@ function fakeComputeDelay() {
 
 function parseLineChat(rawText) {
   const rows = rawText
+    .replace(/^\uFEFF/, "")
     .replace(/\r/g, "")
     .split("\n")
     .map((line) => line.trim())
@@ -410,12 +411,28 @@ function parseLineChat(rawText) {
   let currentMessage = null;
 
   for (const row of rows) {
+    // 1) 日期列：2026/04/10（五） or 2026-04-10
     const dateMatch = row.match(/^(\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2})/);
-    const tabbedMatch = row.match(
-      /^(\d{1,2}:\d{2})(?:\s+|\t+)([^:\t]+?)(?:\s*[:：]|\t)(.+)$/
-    );
+
+    // 2) 完整日期 + 時間 + 名字 + 內容
     const bracketMatch = row.match(
-      /^\[?(\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2})\s+(\d{1,2}:\d{2})\]?\s+([^:：]+)[:：]\s*(.+)$/
+      /^\[?(\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2})\s+((?:上午|下午)?\s*\d{1,2}:\d{2})\]?\s+([^:：\t]+)[:：]\s*(.+)$/
+    );
+
+    const inlineMatch = row.match(
+      /^(\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2})\s+((?:上午|下午)?\s*\d{1,2}:\d{2})\s+([^:：]+)[:：]\s*(.+)$/
+    );
+
+    // 3) 你原本主吃的格式：時間 tab 名字 tab 內容
+    const tabbedMatch = row.match(
+      /^((?:上午|下午)?\s*\d{1,2}:\d{2})(?:\s+|\t+)([^:\t]+?)(?:\s*[:：]|\t)(.+)$/
+    );
+
+    // 4) 寬鬆格式：時間 + 名字 + 內容（不靠 tab）
+    // 例如：09:10 阿晨 早安
+    // 或：下午 8:34 小璃 好
+    const looseLineMatch = row.match(
+      /^((?:上午|下午)?\s*\d{1,2}:\d{2})\s+([^\s:：]+)\s+(.+)$/
     );
 
     if (bracketMatch) {
@@ -431,7 +448,21 @@ function parseLineChat(rawText) {
       continue;
     }
 
-    if (dateMatch && !row.includes("\t") && row.length < 20) {
+    if (inlineMatch) {
+      currentDate = inlineMatch[1];
+      const message = buildMessage(
+        currentDate,
+        inlineMatch[2],
+        inlineMatch[3],
+        inlineMatch[4]
+      );
+      messages.push(message);
+      currentMessage = message;
+      continue;
+    }
+
+    // 只要像日期列就先收日期，不再限制長度
+    if (dateMatch && !tabbedMatch && !bracketMatch && !inlineMatch) {
       currentDate = dateMatch[1];
       continue;
     }
@@ -448,41 +479,54 @@ function parseLineChat(rawText) {
       continue;
     }
 
-    const inlineMatch = row.match(
-      /^(\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2})\s+(\d{1,2}:\d{2})\s+([^:：]+)[:：]\s*(.+)$/
-    );
-    if (inlineMatch) {
-      currentDate = inlineMatch[1];
-      const message = buildMessage(
-        currentDate,
-        inlineMatch[2],
-        inlineMatch[3],
-        inlineMatch[4]
-      );
-      messages.push(message);
-      currentMessage = message;
-      continue;
+    if (looseLineMatch && currentDate) {
+      const speaker = looseLineMatch[2].trim();
+      const content = looseLineMatch[3].trim();
+
+      // 避免整句被誤抓成名字
+      if (speaker.length <= 30 && content.length > 0) {
+        const message = buildMessage(
+          currentDate,
+          looseLineMatch[1],
+          speaker,
+          content
+        );
+        messages.push(message);
+        currentMessage = message;
+        continue;
+      }
     }
 
+    // 其餘情況當續行
     if (currentMessage) {
       currentMessage.content += ` ${row}`;
       currentMessage.wordCount = countWords(currentMessage.content);
     }
   }
 
-  if (messages.length < 4) {
-    throw new Error("可解析訊息過少，請確認檔案是 LINE 匯出的文字格式。");
+  const parsedMessages = messages.filter(
+    (message) => !isSystemMessage(message.content)
+  );
+
+  if (parsedMessages.length < 2) {
+    console.warn("parse failed preview rows:", rows.slice(0, 20));
+    console.warn("raw parsed messages:", messages.slice(0, 10));
+    throw new Error(
+      `可解析訊息過少（目前只抓到 ${parsedMessages.length} 筆），請確認是 LINE 匯出的 .txt。`
+    );
   }
 
-  return messages.filter((message) => !isSystemMessage(message.content));
+  return parsedMessages;
 }
 
 function buildMessage(dateText, timeText, speaker, content) {
   const isoDate = normalizeDate(dateText);
-  const timestamp = new Date(`${isoDate}T${timeText}:00`);
+  const normalizedTime = normalizeLineTime(timeText);
+  const timestamp = new Date(`${isoDate}T${normalizedTime}:00`);
+
   return {
     dateText: isoDate,
-    timeText,
+    timeText: normalizedTime,
     speaker: speaker.trim(),
     content: content.trim(),
     timestamp,
@@ -493,6 +537,51 @@ function buildMessage(dateText, timeText, speaker, content) {
 function normalizeDate(dateText) {
   const [year, month, day] = dateText.replace(/[./]/g, "-").split("-");
   return [year, month.padStart(2, "0"), day.padStart(2, "0")].join("-");
+}
+
+function normalizeLineTime(timeText) {
+  const raw = String(timeText).trim().replace(/\s+/g, "");
+
+  // 下午 8:34 / 上午 9:05
+  const zhMeridiemMatch = raw.match(/^(上午|下午)(\d{1,2}):(\d{2})$/);
+  if (zhMeridiemMatch) {
+    const meridiem = zhMeridiemMatch[1];
+    let hour = Number(zhMeridiemMatch[2]);
+    const minute = zhMeridiemMatch[3];
+
+    if (meridiem === "上午") {
+      if (hour === 12) hour = 0;
+    } else if (meridiem === "下午") {
+      if (hour !== 12) hour += 12;
+    }
+
+    return `${String(hour).padStart(2, "0")}:${minute}`;
+  }
+
+  // AM 8:34 / PM 8:34
+  const enMeridiemMatch = raw.match(/^(AM|PM|am|pm)(\d{1,2}):(\d{2})$/);
+  if (enMeridiemMatch) {
+    const meridiem = enMeridiemMatch[1].toLowerCase();
+    let hour = Number(enMeridiemMatch[2]);
+    const minute = enMeridiemMatch[3];
+
+    if (meridiem === "am") {
+      if (hour === 12) hour = 0;
+    } else if (meridiem === "pm") {
+      if (hour !== 12) hour += 12;
+    }
+
+    return `${String(hour).padStart(2, "0")}:${minute}`;
+  }
+
+  // 純 8:34 / 08:34
+  const plainMatch = raw.match(/^(\d{1,2}):(\d{2})$/);
+  if (plainMatch) {
+    return `${plainMatch[1].padStart(2, "0")}:${plainMatch[2]}`;
+  }
+
+  // fallback，避免整個炸掉
+  return "00:00";
 }
 
 function countWords(content) {
