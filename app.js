@@ -52,8 +52,7 @@ const GHOSTING_HEAVY_MINUTES = 24 * 60; // 24 小時
 const DOUBLE_PING_SHORT_GAP = 30; // 短時間追訊 (30 min)
 const DOUBLE_PING_MEDIUM_GAP = 120; // 中等時間追訊 (120 min)
 
-
-
+const POWER_DEADZONE = 18;
 
 const DOG_CHARACTER_META = {
   邊境牧羊犬型: {
@@ -314,6 +313,9 @@ function initApp() {
       }
     });
   }
+
+  // V3.3 測試組件初始化
+  renderTestCaseButtons();
 }
 
 
@@ -436,142 +438,203 @@ function fakeComputeDelay() {
   });
 }
 
+function classifyLine(row) {
+  const line = row.replace(/\u200b/g, "");
+  const trimmed = line.trim();
+
+  if (/^Saved on:/i.test(trimmed) || /^\[LINE\]/i.test(trimmed)) {
+    return { type: "meta" };
+  }
+
+  // 英文日期列：Tue, 08/27/2024
+  if (/^(Sun|Mon|Tue|Wed|Thu|Fri|Sat),\s+\d{1,2}[\/.-]\d{1,2}[\/.-]\d{4}$/i.test(trimmed)) {
+    return { type: "date_en", raw: trimmed };
+  }
+
+  // 【重要修正】：先判斷訊息列，再判斷純日期列 (防止日期同行訊息被誤吞)
+  if (/^\[?\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2}\s+/.test(trimmed) && /[:：]/.test(trimmed)) {
+    return { type: "inline_candidate", raw: trimmed };
+  }
+
+  // 標準 Tab 格式：09:10\t阿晨\t內容
+  if (line.includes("\t")) {
+    return { type: "tab_candidate", raw: line };
+  }
+
+  // 【精確化】：純數字日期列必須為整行匹配 (防止誤吞)
+  if (/^\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2}(?:（[^）]+）)?$/.test(trimmed)) {
+    return { type: "date_numeric", raw: trimmed };
+  }
+
+  // 寬鬆格式：時間 + 名字 + 內容
+  if (/^((上午|下午|中午|凌晨|AM|PM|am|pm)?\s*\d{1,2}:\d{2}|\d{1,2}:\d{2}\s*(AM|PM|am|pm)?)\s+/.test(trimmed)) {
+    return { type: "loose_candidate", raw: trimmed };
+  }
+
+  return { type: "continuation", raw: line };
+}
+
+function tryParseTabbedMessage(currentDate, row) {
+  const parts = row.split("\t");
+  if (parts.length < 3) return null;
+
+  const timeText = String(parts[0] || "").trim();
+  const speaker = String(parts[1] || "").trim();
+  const content = parts.slice(2).join("\t").trim();
+
+  if (!timeText || !speaker || !content) return null;
+
+  // 【防呆】：如果 speaker 長得像時間或純符號，代表 Tab 解析位移，應棄用
+  if (/^\d{1,2}:\d{2}/.test(speaker) || /^[^\p{L}\p{N}\u4e00-\u9fff]+$/u.test(speaker)) {
+    return null;
+  }
+
+  const normalizedTime = normalizeLineTime(timeText);
+  if (!normalizedTime) return null;
+
+  try {
+    return buildMessage(currentDate, timeText, speaker, content);
+  } catch (e) {
+    return null;
+  }
+}
+
+function tryParseInlineMessage(row) {
+  // 【擴充】：Regex 必須相容 8:34 PM (後置) 格式
+  const match = row.match(
+    /^\[?(\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2})\s+((?:(?:上午|下午|中午|凌晨|AM|PM|am|pm)\s*)?\d{1,2}:\d{2}(?:\s*(?:AM|PM|am|pm))?)\]?\s+([^:：\t]+)[:：]\s*(.+)$/
+  );
+  if (!match) return null;
+
+  try {
+    return buildMessage(match[1], match[2], match[3], match[4]);
+  } catch (e) {
+    return null;
+  }
+}
+
+function tryParseLooseMessage(currentDate, row) {
+  const match = row.match(
+    /^((?:上午|下午|中午|凌晨|AM|PM|am|pm)?\s*\d{1,2}:\d{2}|\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)?)\s+([^\s:：]+)\s+(.+)$/
+  );
+  if (!match) return null;
+
+  const [, timeText, speaker, content] = match;
+  try {
+    return buildMessage(currentDate, timeText, speaker, content);
+  } catch (e) {
+    return null;
+  }
+}
+
+function looksLikeNewMessage(row) {
+  return (
+    /^\[?\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2}\s+/.test(row) ||
+    /^((上午|下午|中午|凌晨|AM|PM|am|pm)?\s*\d{1,2}:\d{2})/.test(row) ||
+    /^\d{1,2}:\d{2}\s*(AM|PM|am|pm)?[\t ]+/.test(row)
+  );
+}
+
 function parseLineChat(rawText) {
   const rows = rawText
     .replace(/^\uFEFF/, "")
     .replace(/\r/g, "")
     .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
+    .filter(line => line.length > 0);
 
   const messages = [];
+  const debug = {
+    totalRows: rows.length,
+    metaRows: 0,
+    dateRows: 0,
+    parsedRows: 0,
+    continuationRows: 0,
+    failedRows: [],
+  };
+
   let currentDate = null;
   let currentMessage = null;
 
-  for (const row of rows) {
-    // A. 中文 / 純數字日期列
-    // 例如：
-    // 2026/04/10（日）
-    // 2026-04-10
-    const numericDateMatch = row.match(/^(\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2})/);
+  for (const rawRow of rows) {
+    const info = classifyLine(rawRow);
 
-    // B. 英文日期列
-    // 例如：
-    // Sun, 08/18/2024
-    // Tue, 9/7/2024
-    const englishDateMatch = row.match(
-      /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat),\s+(\d{1,2}[\/.-]\d{1,2}[\/.-]\d{4})$/i
-    );
-
-    // C. 完整日期 + 時間 + 名字 + 內容
-    // 例如：
-    // 2026/04/10 09:10 阿晨: 早安
-    // [2026/04/10 下午 8:34] 阿晨: 哈哈
-    const bracketMatch = row.match(
-      /^\[?(\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2})\s+((?:上午|下午|中午|凌晨|AM|PM|am|pm)?\s*\d{1,2}:\d{2})\]?\s+([^:：\t]+)[:：]\s*(.+)$/
-    );
-
-    const inlineMatch = row.match(
-      /^(\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2})\s+((?:上午|下午|中午|凌晨|AM|PM|am|pm)?\s*\d{1,2}:\d{2})\s+([^:：]+)[:：]\s*(.+)$/
-    );
-
-    // D. LINE 常見 tab 格式
-    // 例如：
-    // 09:10\t阿晨\t早安
-    // 8:05 PM\tJohn\tHello
-    const tabbedMatch = row.match(
-      /^((?:上午|下午|中午|凌晨|AM|PM|am|pm)?\s*\d{1,2}:\d{2}|\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)?)(?:\s+|\t+)([^:\t]+?)(?:\s*[:：]|\t)(.+)$/
-    );
-
-    // E. 寬鬆格式：時間 + 名字 + 內容
-    // 例如：
-    // 09:10 阿晨 早安
-    // 8:05 PM John Hello
-    const looseLineMatch = row.match(
-      /^((?:上午|下午|中午|凌晨|AM|PM|am|pm)?\s*\d{1,2}:\d{2}|\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)?)\s+([^\s:：]+)\s+(.+)$/
-    );
-
-    if (bracketMatch) {
-      currentDate = bracketMatch[1];
-      const message = buildMessage(
-        currentDate,
-        bracketMatch[2],
-        bracketMatch[3],
-        bracketMatch[4]
-      );
-      messages.push(message);
-      currentMessage = message;
+    if (info.type === "meta") {
+      debug.metaRows += 1;
       continue;
     }
 
-    if (inlineMatch) {
-      currentDate = inlineMatch[1];
-      const message = buildMessage(
-        currentDate,
-        inlineMatch[2],
-        inlineMatch[3],
-        inlineMatch[4]
+    if (info.type === "date_en") {
+      const m = info.raw.match(
+        /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat),\s+(\d{1,2}[\/.-]\d{1,2}[\/.-]\d{4})$/i
       );
-      messages.push(message);
-      currentMessage = message;
-      continue;
-    }
-
-    if (englishDateMatch) {
-      currentDate = englishDateMatch[2];
+      currentDate = m ? m[2] : null;
       currentMessage = null;
+      debug.dateRows += 1;
       continue;
     }
 
-    if (numericDateMatch && !tabbedMatch && !bracketMatch && !inlineMatch) {
-      currentDate = numericDateMatch[1];
+    if (info.type === "date_numeric") {
+      const m = info.raw.match(/^(\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2})/);
+      currentDate = m ? m[1] : null;
       currentMessage = null;
+      debug.dateRows += 1;
       continue;
     }
 
-    if (tabbedMatch && currentDate) {
-      const message = buildMessage(
-        currentDate,
-        tabbedMatch[1],
-        tabbedMatch[2],
-        tabbedMatch[3]
-      );
-      messages.push(message);
-      currentMessage = message;
-      continue;
-    }
+    let parsed = null;
 
-    if (looseLineMatch && currentDate) {
-      const speaker = looseLineMatch[2].trim();
-      const content = looseLineMatch[3].trim();
-
-      if (speaker.length <= 20 && content.length > 0) {
-        const message = buildMessage(
-          currentDate,
-          looseLineMatch[1],
-          speaker,
-          content
-        );
-        messages.push(message);
-        currentMessage = message;
-        continue;
+    // 【核心修正】：先吃不依賴 currentDate 的完整同行格式 (Inline)
+    if (info.type === "inline_candidate") {
+      parsed = tryParseInlineMessage(info.raw);
+      if (parsed) {
+        currentDate = parsed.dateText;
       }
     }
 
-    // 續行訊息
-    if (currentMessage) {
-      currentMessage.content += ` ${row}`;
-      currentMessage.wordCount = countWords(currentMessage.content);
+    // 其餘格式（Tab / Loose）才依賴 currentDate
+    if (!parsed && !currentDate) {
+      debug.failedRows.push({ row: rawRow, reason: "no_current_date" });
+      continue;
     }
+
+    if (!parsed && info.type === "tab_candidate") {
+      parsed = tryParseTabbedMessage(currentDate, info.raw);
+    }
+
+    if (!parsed && info.type === "loose_candidate") {
+      parsed = tryParseLooseMessage(currentDate, info.raw);
+    }
+
+    if (parsed) {
+      messages.push(parsed);
+      currentMessage = parsed;
+      debug.parsedRows += 1;
+      continue;
+    }
+
+    // 續行處理：若沒被解析為新訊息，且目前有「進行中」的訊息，且該行「看起來不像新訊息」才併入
+    if (currentMessage && !looksLikeNewMessage(rawRow)) {
+      currentMessage.content += ` ${String(rawRow).trim()}`;
+      currentMessage.wordCount = countWords(currentMessage.content);
+      debug.continuationRows += 1;
+      continue;
+    }
+
+    debug.failedRows.push({ row: rawRow, reason: "unparsed_or_standalone_continuation" });
   }
 
-  const parsedMessages = messages.filter(
-    (message) => !isSystemMessage(message.content)
-  );
+  const normalizedMessages = messages.map(msg => ({
+    ...msg,
+    isSystem: isSystemMessage(msg.content),
+  }));
+
+  const parsedMessages = normalizedMessages.filter(msg => !msg.isSystem);
+
+  console.log("parse debug:", debug);
+  console.log("parsed preview:", parsedMessages.slice(0, 8));
 
   if (parsedMessages.length < 2) {
-    console.warn("parse failed preview rows:", rows.slice(0, 20));
-    console.warn("raw parsed messages:", messages.slice(0, 10));
+    console.warn("failed rows preview:", debug.failedRows.slice(0, 10));
     throw new Error(
       `可解析訊息過少（目前只抓到 ${parsedMessages.length} 筆），請確認是 LINE 匯出的 .txt。`
     );
@@ -589,6 +652,16 @@ function isValidTimeString(timeText) {
 }
 
 function buildMessage(dateText, timeText, speaker, content) {
+  const cleanSpeaker = String(speaker || "").trim();
+  const cleanContent = String(content || "").trim();
+
+  if (!cleanSpeaker) {
+    throw new Error(`[E_SPEAKER_PARSE] 無法解析說話者：${dateText} ${timeText}`);
+  }
+  if (!cleanContent) {
+    throw new Error(`[E_CONTENT_PARSE] 無法解析內容：${dateText} ${timeText}`);
+  }
+
   const isoDate = normalizeDate(dateText);
   const normalizedTime = normalizeLineTime(timeText);
 
@@ -609,11 +682,11 @@ function buildMessage(dateText, timeText, speaker, content) {
   return {
     dateText: isoDate,
     timeText: normalizedTime,
-    speaker: speaker.trim(),
-    speakerDisplay: speaker.trim(),
-    content: content.trim(),
+    speaker: cleanSpeaker,
+    speakerDisplay: cleanSpeaker,
+    content: cleanContent,
     timestamp,
-    wordCount: countWords(content),
+    wordCount: countWords(cleanContent),
   };
 }
 
@@ -718,10 +791,21 @@ function consolidateSpeakers(messages) {
   };
 }
 
+function isGarbageSpeaker(name) {
+  const s = String(name || "").trim();
+  if (!s) return true;
+  if (s === "()" || s === "（）」" || s === "（)" || s === "()") return true;
+  if (/^[()（）\[\]\s._-]+$/.test(s)) return true;
+  return false;
+}
+
 function selectTopTwoSpeakers(messages) {
   const { messages: normalizedMessages, counts, canonicalDisplayMap } = consolidateSpeakers(messages);
 
-  const sorted = Object.keys(counts).sort((a, b) => counts[b] - counts[a]);
+  const sorted = Object.keys(counts)
+    .filter(name => !isGarbageSpeaker(name))
+    .sort((a, b) => counts[b] - counts[a]);
+
   console.log("raw speakers found:", sorted, counts);
 
   if (sorted.length < 2) {
@@ -1033,9 +1117,9 @@ function analyzeMessages(messages, subjectName = null) {
   // 判定是否進入「低樣本保守模式」
   const dayCount = new Set(messages.map(m => m.dateText)).size;
   const isConservative =
-    messages.length < 20 ||
-    responsePairs.length < 8 ||
-    dayCount <= 1;
+    (messages.length < 16 && responsePairs.length < 6) ||
+    messages.length < 12 ||
+    responsePairs.length < 4;
 
   const initiationBias = computeInitiationBias(messages, speakerA, speakerB);
   const messageBalance = computeMessageBalance(messages, speakerA, speakerB);
@@ -1096,21 +1180,22 @@ function analyzeMessages(messages, subjectName = null) {
   const povSpeaker = subjectName || appState.subjectSpeaker || speakerA;
   const counterpartName = speakerA === povSpeaker ? speakerB : speakerA;
 
-  // 計算雙方的 PowerScore 用於互相輸入
-  const mySignals = computeDogSignals(inputForClassification, povSpeaker, 0);
-  const cpSignals = computeDogSignals(inputForClassification, counterpartName, 0);
+  const myBaseSignals = computeDogSignals(inputForClassification, povSpeaker, 0);
+  const cpBaseSignals = computeDogSignals(inputForClassification, counterpartName, 0);
 
-  // 12 種犬種判定 (回傳評分物件以計算 Mix)
+  const mySignals = computeDogSignals(inputForClassification, povSpeaker, cpBaseSignals.powerScore);
+  const cpSignals = computeDogSignals(inputForClassification, counterpartName, myBaseSignals.powerScore);
+
   const myScores = classifyDogType(inputForClassification, povSpeaker, cpSignals.powerScore);
-  const dogType = resolvePrimaryType(myScores, inputForClassification);
+  const dogType = resolvePrimaryType(myScores, inputForClassification, povSpeaker);
   const personalityMix = calculatePersonalityMix(myScores, dogType);
 
   const cpScores = classifyDogType(inputForClassification, counterpartName, mySignals.powerScore);
-  const counterpartType = resolvePrimaryType(cpScores, inputForClassification);
+  const counterpartType = resolvePrimaryType(cpScores, inputForClassification, counterpartName);
 
   const myPower = mySignals.powerScore;
   const cpPower = cpSignals.powerScore;
-  const isPursuer = myPower < cpPower;
+  const isPursuer = mySignals.isPursuer;
 
   const participantsArray = [povSpeaker, counterpartName];
   const displayMap = appState.canonicalDisplayMap || {};
@@ -1352,33 +1437,27 @@ function computeDoublePingPenalty(blocks) {
 function computeDogSignals(input, targetSpeaker, counterpartPower = 0) {
   const myInitiation = input.initiationBias[targetSpeaker] || 0.5;
   const myMessageShare = input.messageBalance[targetSpeaker] || 0.5;
-
   const powerScore = (0.5 - myInitiation) * 200 + (0.5 - myMessageShare) * 100;
-
-  const isPursuer = powerScore < counterpartPower;
-  const isHighPosition = powerScore > counterpartPower + 18;
-
+  const powerGap = powerScore - counterpartPower;
+  const isPursuer = powerGap < -POWER_DEADZONE;
+  const isHighPosition = powerGap > POWER_DEADZONE;
+  const isBalancedPower = Math.abs(powerGap) <= POWER_DEADZONE;
   const isLowOutput = myMessageShare < 0.38;
   const isMidOutput = myMessageShare >= 0.38 && myMessageShare <= 0.62;
   const isHighOutput = myMessageShare > 0.62;
-
   const isPassive = myInitiation < 0.42;
   const isBalancedInitiation = myInitiation >= 0.42 && myInitiation <= 0.58;
   const isActive = myInitiation > 0.58;
-
   const latencyVeryStrong = input.avgLatencyScore >= 0.88;
   const latencyStrong = input.avgLatencyScore >= 0.72;
   const latencyMid = input.avgLatencyScore >= 0.5 && input.avgLatencyScore <= 0.82;
   const latencyWeak = input.avgLatencyScore < 0.45;
-
   const payloadStrong = input.avgPayloadScore >= 0.8;
   const payloadVeryStrong = input.avgPayloadScore >= 0.88;
   const payloadWeak = input.avgPayloadScore < 0.45;
-
   const chaotic =
     input.stabilityFlag === "UNSTABLE" &&
     (input.jitterMinutes >= 180 || input.anxietySignal);
-
   const nearZombie =
     (
       input.ghostingPenalty >= 12 &&
@@ -1389,13 +1468,14 @@ function computeDogSignals(input, targetSpeaker, counterpartPower = 0) {
       input.syncRate < 30 &&
       input.relationshipModel === "斷線關係"
     );
-
   return {
     myInitiation,
     myMessageShare,
     powerScore,
+    powerGap,
     isPursuer,
     isHighPosition,
+    isBalancedPower,
     isLowOutput,
     isMidOutput,
     isHighOutput,
@@ -1512,17 +1592,27 @@ function classifyDogType(input, targetSpeaker = null, counterpartPower = 0) {
     scores["邊境牧羊犬型"] += 24;
   }
 
-  // 貴賓狗：投入、體面、節制、不失控
-  if (input.avgPayloadScore > 0.8) scores["貴賓狗型"] += 18;
-  if (input.avgPayloadScore > 0.9) scores["貴賓狗型"] += 10;
-  if (input.doublePingPenalty === 0) scores["貴賓狗型"] += 10;
-  if (!input.anxietySignal && !s.chaotic) scores["貴賓狗型"] += 6;
-  if (
+  // 【V3.2 窄化】：貴賓狗不再是預設中間桶，需滿足精緻輸出門檻
+  const poodleGate =
+    input.avgPayloadScore >= 0.78 &&
+    input.doublePingPenalty === 0 &&
+    !input.anxietySignal &&
+    !s.chaotic &&
     s.isHighOutput &&
-    input.avgLatencyScore >= 0.5 &&
-    input.avgLatencyScore <= 0.88
-  ) {
-    scores["貴賓狗型"] += 12;
+    input.avgLatencyScore >= 0.58 &&
+    input.avgLatencyScore <= 0.86;
+
+  if (poodleGate) {
+    scores["貴賓狗型"] += 18;
+    if (input.avgPayloadScore >= 0.9) {
+      scores["貴賓狗型"] += 8;
+    }
+    // 依據地位差分流
+    if (s.isPursuer) {
+      scores["黃金獵犬型"] += 8;
+    } else if (s.isHighPosition) {
+      scores["佛系和尚狗型"] += 8;
+    }
   }
 
   if (input.avgLatencyScore < 0.45) {
@@ -1558,13 +1648,6 @@ function classifyDogType(input, targetSpeaker = null, counterpartPower = 0) {
       scores["哈比小狗型"] += 28;
     }
 
-    if (
-      !input.anxietySignal &&
-      input.doublePingPenalty === 0 &&
-      input.avgPayloadScore > 0.72
-    ) {
-      scores["貴賓狗型"] += 14;
-    }
 
     if (s.nearZombie && s.isHighOutput) {
       scores["殭屍狗型"] += 24;
@@ -1603,7 +1686,7 @@ function classifyDogType(input, targetSpeaker = null, counterpartPower = 0) {
       } else if (input.stabilityFlag === "STABLE") {
         scores["柴犬型"] += 16;
       } else {
-        scores["貴賓狗型"] += 12;
+        scores["黃金獵犬型"] += 12;
       }
     }
   }
@@ -1624,11 +1707,6 @@ function classifyDogType(input, targetSpeaker = null, counterpartPower = 0) {
   // G. 細補強
   if (s.nearZombie) {
     scores["殭屍狗型"] += 16;
-  }
-
-  // 中間角色引流
-  if (input.avgPayloadScore > 0.72 && input.doublePingPenalty === 0) {
-    scores["貴賓狗型"] += 8;
   }
 
   if (input.avgLatencyScore < 0.45 && input.stabilityFlag === "STABLE") {
@@ -1665,7 +1743,159 @@ const STABLE_TYPES = new Set([
   "哈士奇型",
 ]);
 
-function resolvePrimaryType(scores, input) {
+function canBeBorderCollie(input, targetSpeaker) {
+  const init = input.initiationBias[targetSpeaker] || 0.5;
+  const share = input.messageBalance[targetSpeaker] || 0.5;
+  const speakers = Object.keys(input.messageBalance || {});
+  const otherSpeaker = speakers.find(name => name !== targetSpeaker);
+  const otherInit = otherSpeaker ? (input.initiationBias[otherSpeaker] || 0.5) : 0.5;
+  const otherShare = otherSpeaker ? (input.messageBalance[otherSpeaker] || 0.5) : 0.5;
+  const initGap = Math.abs(init - otherInit);
+  const shareGap = Math.abs(share - otherShare);
+  return (
+    input.relationshipModel === "雙向同步" &&
+    input.avgLatencyScore >= 0.72 &&
+    input.avgPayloadScore >= 0.58 &&
+    input.stabilityFlag === "STABLE" &&
+    init >= 0.35 &&
+    init <= 0.65 &&
+    share >= 0.38 &&
+    share <= 0.62 &&
+    initGap <= 0.28 &&
+    shareGap <= 0.22 &&
+    input.doublePingPenalty <= 4 &&
+    !input.anxietySignal
+  );
+}
+
+function determinePrimaryType(input, targetSpeaker, counterpartPower = 0) {
+  const s = computeDogSignals(input, targetSpeaker, counterpartPower);
+  if (input.isConservative || (input.confidenceValue || 100) < 55) {
+    const safeScores = {
+      "邊境牧羊犬型": 0,
+      "黃金獵犬型": 0,
+      "貴賓狗型": 0,
+      "柴犬型": 0,
+      "佛系和尚狗型": 0,
+      "哈比小狗型": 0,
+    };
+    if (canBeBorderCollie(input, targetSpeaker) && (s.isBalancedPower || !s.isPursuer)) {
+      safeScores["邊境牧羊犬型"] += 5;
+    }
+    if (input.avgLatencyScore < 0.45) {
+      safeScores["柴犬型"] += 4;
+    }
+    if (!s.isPursuer && s.isPassive && s.isLowOutput) {
+      safeScores["佛系和尚狗型"] += 4;
+    }
+    if (
+      s.isPursuer &&
+      input.syncRate >= 55 &&
+      input.syncRate <= 78 &&
+      input.doublePingPenalty < 8 &&
+      !input.anxietySignal &&
+      input.avgPayloadScore >= 0.45 &&
+      input.avgPayloadScore <= 0.72
+    ) {
+      safeScores["哈比小狗型"] += 4;
+    }
+    if (
+      s.isPursuer &&
+      !canBeBorderCollie(input, targetSpeaker) &&
+      input.avgPayloadScore >= 0.62 &&
+      input.avgPayloadScore <= 0.88 &&
+      input.doublePingPenalty < 6 &&
+      !input.anxietySignal &&
+      input.avgLatencyScore >= 0.45 &&
+      input.syncRate < 82
+    ) {
+      safeScores["黃金獵犬型"] += 4;
+    }
+    if (
+      input.avgPayloadScore >= 0.78 &&
+      input.doublePingPenalty === 0 &&
+      !input.anxietySignal &&
+      input.avgLatencyScore >= 0.58 &&
+      input.avgLatencyScore <= 0.82 &&
+      !s.isPursuer
+    ) {
+      safeScores["貴賓狗型"] += 2;
+    }
+    const best = Object.entries(safeScores).sort((a, b) => b[1] - a[1])[0];
+    return best && best[1] > 0 ? best[0] : "柴犬型";
+  }
+  if (
+    input.relationshipModel === "斷線關係" &&
+    input.ghostingPenalty >= 12 &&
+    input.syncRate <= 20 &&
+    (input.responsePairCount || 0) >= 4
+  ) {
+    return "殭屍狗型";
+  }
+  if (canBeBorderCollie(input, targetSpeaker) && (s.isBalancedPower || !s.isPursuer)) {
+    return "邊境牧羊犬型";
+  }
+  if (
+    s.isPursuer &&
+    input.syncRate >= 55 &&
+    input.syncRate <= 78 &&
+    input.doublePingPenalty < 8 &&
+    !input.anxietySignal &&
+    input.avgPayloadScore >= 0.45 &&
+    input.avgPayloadScore <= 0.72
+  ) {
+    return "哈比小狗型";
+  }
+  if (
+    s.isPursuer &&
+    !canBeBorderCollie(input, targetSpeaker) &&
+    input.avgPayloadScore >= 0.62 &&
+    input.avgPayloadScore <= 0.88 &&
+    input.doublePingPenalty < 6 &&
+    !input.anxietySignal &&
+    input.avgLatencyScore >= 0.45 &&
+    input.syncRate < 82
+  ) {
+    return "黃金獵犬型";
+  }
+  if (
+    s.isPursuer &&
+    (
+      input.doublePingPenalty >= 12 ||
+      (input.doublePingPenalty >= 8 && input.anxietySignal && input.syncRate < 50)
+    )
+  ) {
+    return "流浪狗型";
+  }
+  if (
+    !s.isPursuer &&
+    s.isPassive &&
+    s.isLowOutput &&
+    input.avgPayloadScore < 0.5 &&
+    input.stabilityFlag === "STABLE"
+  ) {
+    return "高冷黑貓型";
+  }
+  if (
+    !s.isPursuer &&
+    s.isPassive &&
+    s.isLowOutput &&
+    input.doublePingPenalty === 0 &&
+    input.stabilityFlag === "STABLE"
+  ) {
+    return "佛系和尚狗型";
+  }
+  if (
+    !s.isPursuer &&
+    (s.powerScore > 88 || (s.isActive && s.powerScore > 62))
+  ) {
+    return "狼系主宰型";
+  }
+  const scores = classifyDogType(input, targetSpeaker, counterpartPower);
+  return resolvePrimaryType(scores, input, targetSpeaker);
+}
+
+function resolvePrimaryType(scores, input, targetSpeaker = null) {
   const sorted = Object.entries(scores).sort((a, b) => b[1] - a[1]);
   const [topName, topScore] = sorted[0] || ["柴犬型", 0];
   const [secondName, secondScore] = sorted[1] || ["柴犬型", 0];
@@ -1690,7 +1920,7 @@ function resolvePrimaryType(scores, input) {
       if (STABLE_TYPES.has(secondName)) {
         return secondName;
       }
-      return fallbackStableType(sorted, input);
+      return fallbackStableType(sorted, input, targetSpeaker);
     }
   }
 
@@ -1716,7 +1946,7 @@ function resolvePrimaryType(scores, input) {
       if (secondName === "貴賓狗型" || secondName === "黃金獵犬型") {
         return secondName;
       }
-      return "貴賓狗型";
+      return "柴犬型";
     }
   }
 
@@ -1738,8 +1968,7 @@ function passesDramaticGate(type, topScore, gap, input) {
         topScore >= 40 &&
         gap >= 10 &&
         (input.doublePingPenalty >= 12 ||
-          input.ghostingPenalty >= 3 ||
-          (input.syncRate < 50 && input.anxietySignal))
+          (input.doublePingPenalty >= 8 && input.anxietySignal && input.syncRate < 50))
       );
 
     case "警犬型":
@@ -1779,16 +2008,24 @@ function passesDramaticGate(type, topScore, gap, input) {
   }
 }
 
-function fallbackStableType(sorted, input) {
+function fallbackStableType(sorted, input, targetSpeaker = null) {
   const stableCandidate = sorted.find(([name]) => STABLE_TYPES.has(name));
   if (stableCandidate) return stableCandidate[0];
 
-  if (input.stabilityFlag === "STABLE" && input.avgPayloadScore >= 0.5) {
-    return "佛系和尚狗型";
-  }
+  const share = targetSpeaker ? (input.messageBalance[targetSpeaker] || 0.5) : 0.5;
+  const init = targetSpeaker ? (input.initiationBias[targetSpeaker] || 0.5) : 0.5;
 
   if (input.avgLatencyScore < 0.45) {
     return "柴犬型";
+  }
+
+  // 依據角色主動性分流 Fallback
+  if (share > 0.6 || init > 0.58) {
+    return "黃金獵犬型";
+  }
+
+  if (share < 0.42 && init < 0.45) {
+    return "佛系和尚狗型";
   }
 
   return "貴賓狗型";
@@ -1841,82 +2078,115 @@ function fallbackStableType(sorted, input) {
     return `${mainText} 目前模型判定為「${relationshipModel}」，同步率 ${finalSyncRate}%，穩定性 ${stabilityFlag}，總懲罰 ${penaltyTotal}。`;
   }
 
-  function applySafetyOverride(result) {
-    const m = result.metadata;
-    const dramatic = new Set([
-      "殭屍狗型",
-      "流浪狗型",
-      "吉娃娃型",
-      "警犬型",
-      "高冷黑貓型",
-      "狼系主宰型"
-    ]);
-
-    if (!dramatic.has(m.dogType)) return result;
-
-    let overridden = false;
-
-    if (m.isConservative) {
-      m.dogType = "黃金獵犬型";
-      m.dogCharacter = DOG_CHARACTER_META["黃金獵犬型"];
-      overridden = true;
-    }
-
-    if (m.responsePairCount < 4) {
+function applySafetyOverride(result) {
+  const m = result.metadata;
+  const dramatic = new Set([
+    "殭屍狗型",
+    "流浪狗型",
+    "吉娃娃型",
+    "警犬型",
+    "高冷黑貓型",
+    "狼系主宰型"
+  ]);
+  // 普通犬種不碰
+  if (!dramatic.has(m.dogType)) return result;
+  let overridden = false;
+  // 樣本太少時，戲劇型降級
+  if (m.responsePairCount < 4) {
+    if (m.relationshipModel === "雙向同步") {
+      m.dogType = "邊境牧羊犬型";
+      m.dogCharacter = DOG_CHARACTER_META["邊境牧羊犬型"];
+    } else if (m.latencyScore < 0.42) {
       m.dogType = "柴犬型";
       m.dogCharacter = DOG_CHARACTER_META["柴犬型"];
-      overridden = true;
-    }
-
-    if ((m.confidence?.value || 100) < 55) {
+    } else if (m.payloadScore > 0.78 && m.penalties.doublePinging === 0) {
       m.dogType = "貴賓狗型";
       m.dogCharacter = DOG_CHARACTER_META["貴賓狗型"];
-      overridden = true;
+    } else {
+      m.dogType = "黃金獵犬型";
+      m.dogCharacter = DOG_CHARACTER_META["黃金獵犬型"];
     }
-
-    // 斷線但證據不夠，降級
-    if (
-      m.dogType === "殭屍狗型" &&
-      (m.relationshipModel !== "斷線關係" || m.penalties.ghosting < 12)
-    ) {
+    overridden = true;
+  }
+  // 信心太低時，戲劇型降級
+  if ((m.confidence?.value || 100) < 55) {
+    if (m.latencyScore < 0.42) {
       m.dogType = "柴犬型";
       m.dogCharacter = DOG_CHARACTER_META["柴犬型"];
-      overridden = true;
+    } else if (m.payloadScore > 0.78 && m.penalties.doublePinging === 0) {
+      m.dogType = "貴賓狗型";
+      m.dogCharacter = DOG_CHARACTER_META["貴賓狗型"];
+    } else {
+      m.dogType = "黃金獵犬型";
+      m.dogCharacter = DOG_CHARACTER_META["黃金獵犬型"];
     }
-
-    if (overridden) {
-      m.personalityMix = [
-        {
-          name: m.dogType.replace("型", ""),
-          percentage: 100,
-          color: m.dogCharacter.accent
-        }
-      ];
-    }
-
-    return result;
+    overridden = true;
   }
+  // 殭屍證據不足，降級
+  if (
+    m.dogType === "殭屍狗型" &&
+    (m.relationshipModel !== "斷線關係" || m.penalties.ghosting < 12)
+  ) {
+    m.dogType = "柴犬型";
+    m.dogCharacter = DOG_CHARACTER_META["柴犬型"];
+    overridden = true;
+  }
+  if (overridden) {
+    m.personalityMix = calculatePersonalityMix(
+      { [m.dogType]: 100 },
+      m.dogType
+    );
+  }
+  return result;
+}
 
   function calculatePersonalityMix(scores, primaryType = null) {
-    const personalityScores = { ...scores };
+    if (!primaryType) return [];
+    const cloned = { ...scores };
+    // 主類型拿固定 60%
+    delete cloned[primaryType];
+    const secondary = Object.entries(cloned)
+      .filter(([, score]) => score > 0)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 2);
 
-    // 【視覺一致化】：為主類型注入保底權重，確保混血第一順位與主判定一致
-    if (primaryType && personalityScores[primaryType] != null) {
-      personalityScores[primaryType] += 12;
+    const result = [
+      {
+        name: primaryType.replace("型", ""),
+        percentage: 60,
+        color: DOG_CHARACTER_META[primaryType]?.accent || "#ccc"
+      }
+    ];
+
+    if (!secondary.length) return result;
+
+    const secondaryTotal = secondary.reduce((sum, [, score]) => sum + score, 0);
+
+    if (secondary.length === 1) {
+      result.push({
+        name: secondary[0][0].replace("型", ""),
+        percentage: 40,
+        color: DOG_CHARACTER_META[secondary[0][0]]?.accent || "#ccc"
+      });
+      return result;
     }
 
-    const total = Object.values(personalityScores).reduce((a, b) => a + b, 0);
-    if (total === 0) return [];
+    const firstPct = Math.round((secondary[0][1] / secondaryTotal) * 40);
+    const secondPct = 40 - firstPct;
 
-    return Object.entries(personalityScores)
-      .map(([name, score]) => ({
-        name: name.replace("型", ""),
-        percentage: Math.round((score / total) * 100),
-        color: DOG_CHARACTER_META[name]?.accent || "#ccc"
-      }))
-      .filter(item => item.percentage > 8)
-      .sort((a, b) => b.percentage - a.percentage)
-      .slice(0, 3);
+    result.push({
+      name: secondary[0][0].replace("型", ""),
+      percentage: firstPct,
+      color: DOG_CHARACTER_META[secondary[0][0]]?.accent || "#ccc"
+    });
+
+    result.push({
+      name: secondary[1][0].replace("型", ""),
+      percentage: secondPct,
+      color: DOG_CHARACTER_META[secondary[1][0]]?.accent || "#ccc"
+    });
+
+    return result;
   }
 
 function classifyRelationship(input) {
@@ -3325,10 +3595,287 @@ function classifyRelationship(input) {
   };
 
 
-  if (typeof window !== 'undefined') {
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', initApp);
-    } else {
-      initApp();
+
+  // ==========================================
+  // V3.3 測試組件 (Development & Calibration)
+  // ==========================================
+
+  const TEST_CASES = [
+    {
+      name: "01_雙向穩定同步_邊牧傾向",
+      expectedPOV: {
+        阿晨: "邊境牧羊犬型",
+        小璃: "邊境牧羊犬型",
+      },
+      text: `2026/04/10（五）
+09:00\t阿晨\t早安 你到了嗎
+09:03\t小璃\t快到了 你呢
+09:05\t阿晨\t我剛進公司
+09:07\t小璃\t今天會有點忙 但中午可以回你
+12:15\t阿晨\t好啊 那你先忙
+12:18\t小璃\t剛忙完一段 你吃了沒
+12:20\t阿晨\t正要去吃 你也快去
+18:42\t小璃\t下班了
+18:45\t阿晨\t我也是 要不要晚點打電話
+18:49\t小璃\t可以啊 我洗完澡打給你
+22:11\t阿晨\t好 那我等你
+22:15\t小璃\t我好了`
+    },
+    {
+      name: "02_單向溫柔輸出_黃金傾向",
+      expectedPOV: {
+        阿晨: "黃金獵犬型",
+        小璃: "柴犬型",
+      },
+      text: `2026/04/10（五）
+08:42\t阿晨\t早安 你今天是不是要開會
+10:18\t小璃\t嗯
+10:22\t阿晨\t那你加油 中午記得吃飯
+13:47\t小璃\t剛結束
+13:49\t阿晨\t辛苦了 有比較順嗎
+13:55\t小璃\t還行
+13:57\t阿晨\t那就好 我本來有點擔心你
+19:08\t阿晨\t你晚上還有空嗎
+21:34\t小璃\t今天不行
+21:36\t阿晨\t沒事 你先休息比較重要
+23:02\t阿晨\t晚安`
+    },
+    {
+      name: "03_慢回但穩定_柴犬傾向",
+      expectedPOV: {
+        阿晨: "柴犬型",
+        小璃: "黃金獵犬型",
+      },
+      text: `2026/04/10（五）
+09:10\t小璃\t你今天比較早起欸
+12:26\t阿晨\t對 剛剛在忙
+12:27\t阿晨\t你午餐吃了嗎
+12:31\t小璃\t還沒 等等去買
+16:48\t阿晨\t我剛開完會
+16:49\t阿晨\t你下午還好嗎
+16:55\t小璃\t還行哈哈
+22:14\t阿晨\t那就好
+2026/04/11（六）
+10:22\t小璃\t你昨天很晚睡喔
+13:40\t阿晨\t有一點
+13:41\t阿晨\t今天想在家休息
+13:45\t小璃\t好啊 那你好好休息`
+    },
+    {
+      name: "04_高頻追訊_流浪狗傾向",
+      expectedPOV: {
+        阿晨: "流浪狗型",
+        小璃: "高冷黑貓型",
+      },
+      text: `2026/04/10（五）
+09:12\t阿晨\t早
+09:26\t阿晨\t你起床了嗎
+09:41\t阿晨\t今天是不是很忙
+10:58\t小璃\t在忙
+11:01\t阿晨\t好 那你先忙
+11:24\t阿晨\t午餐記得吃
+13:10\t阿晨\t我剛剛看到一個超好笑的東西
+15:36\t小璃\t晚點看
+15:38\t阿晨\t好
+18:10\t阿晨\t你忙完了嗎
+18:33\t阿晨\t還在公司嗎
+21:52\t小璃\t還沒回家
+21:54\t阿晨\t辛苦了
+23:40\t阿晨\t晚安`
+    },
+    {
+      name: "05_高頻焦慮短訊_吉娃娃傾向",
+      expectedPOV: {
+        阿晨: "吉娃娃型",
+        小璃: "高冷黑貓型",
+      },
+      text: `2026/04/10（五）
+08:58\t阿晨\t早
+09:03\t阿晨\t起床沒
+09:08\t阿晨\t欸
+09:13\t阿晨\t你今天有上班嗎
+10:20\t小璃\t有
+10:21\t阿晨\t喔喔
+10:31\t阿晨\t那你忙
+12:44\t阿晨\t吃了嗎
+12:51\t阿晨\t還沒喔
+13:40\t小璃\t還沒
+13:41\t阿晨\t好
+18:20\t阿晨\t下班了嗎
+18:36\t阿晨\t還沒嗎
+22:10\t小璃\t還沒
+22:12\t阿晨\t喔`
+    },
+    {
+      name: "06_秒回高警覺_警犬傾向",
+      expectedPOV: {
+        阿晨: "警犬型",
+        小璃: "黃金獵犬型",
+      },
+      text: `2026/04/10（五）
+09:00\t小璃\t我等等要去報告 有點緊張
+09:01\t阿晨\t別怕 你昨天不是都準備好了
+09:02\t小璃\t還是有點慌
+09:03\t阿晨\t你先深呼吸 然後照順序講
+09:05\t小璃\t好
+09:06\t阿晨\t我中午等你消息
+12:01\t小璃\t講完了
+12:02\t阿晨\t怎麼樣
+12:03\t小璃\t比想像中好
+12:04\t阿晨\t我就知道你可以
+18:10\t小璃\t我現在整個放鬆了
+18:11\t阿晨\t那就好 晚點去吃好吃的`
+    },
+    {
+      name: "07_忽冷忽熱混亂_哈士奇傾向",
+      expectedPOV: {
+        阿晨: "哈士奇型",
+        小璃: "柴犬型",
+      },
+      text: `2026/04/10（五）
+09:00\t阿晨\t早安早安早安
+09:01\t阿晨\t我剛剛差點睡過頭
+09:02\t阿晨\t超好笑
+09:08\t小璃\t哈哈
+09:10\t阿晨\t你今天忙嗎
+09:11\t阿晨\t我等等想喝咖啡
+09:12\t阿晨\t還是奶茶
+14:42\t小璃\t剛剛在忙
+14:44\t阿晨\t喔喔沒事
+14:45\t阿晨\t你忙你的
+22:30\t阿晨\t我剛剛又突然想到你早上那句很好笑
+22:31\t阿晨\t算了你應該睡了
+2026/04/11（六）
+13:20\t小璃\t我昨天真的睡了
+13:24\t阿晨\t哈哈哈哈我就知道`
+    },
+    {
+      name: "08_體面高投入_貴賓傾向",
+      expectedPOV: {
+        阿晨: "貴賓狗型",
+        小璃: "柴犬型",
+      },
+      text: `2026/04/10（五）
+10:10\t阿晨\t你昨天提到的那個專案，我剛剛想了一下，可能可以先把資料整理成三段，這樣你下午報告比較好講。
+12:46\t小璃\t好像可以
+12:50\t阿晨\t如果你需要，我晚點也可以幫你看一下順序。
+18:12\t小璃\t我剛整理完
+18:16\t阿晨\t那很好，至少主線有出來。你等等如果還想確認，我可以幫你聽一次。
+22:08\t小璃\t今天先不用 我有點累
+22:10\t阿晨\t好，那你先休息。你今天已經做得很多了。`
+    },
+    {
+      name: "09_離線斷線_殭屍傾向",
+      expectedPOV: {
+        阿晨: "殭屍狗型",
+        小璃: "高冷黑貓型",
+      },
+      text: `2026/04/10（五）
+09:00\t阿晨\t早安
+12:10\t阿晨\t你今天是不是很忙
+18:42\t阿晨\t我剛下班
+22:18\t阿晨\t你有到家嗎
+2026/04/11（六）
+09:12\t阿晨\t昨天是不是太累了
+13:26\t阿晨\t那你先休息
+20:58\t阿晨\t晚安
+2026/04/12（日）
+11:00\t阿晨\t你還好嗎
+17:40\t阿晨\t如果你最近不想聊天也可以跟我說`
+    },
+    {
+      name: "10_低輸出低主動_佛系和尚傾向",
+      expectedPOV: {
+        阿晨: "佛系和尚狗型",
+        小璃: "黃金獵犬型",
+      },
+      text: `2026/04/10（五）
+09:16\t小璃\t早安 你今天有比較好嗎
+11:44\t阿晨\t有 比昨天好一點
+11:50\t小璃\t那就好 我本來有點擔心
+11:58\t阿晨\t沒事
+18:20\t小璃\t你晚餐吃了嗎
+19:30\t阿晨\t吃了
+19:31\t阿晨\t你呢
+19:33\t小璃\t我等等去買
+19:40\t阿晨\t好
+2026/04/11（六）
+10:08\t小璃\t今天會出門嗎
+13:22\t阿晨\t應該不會
+13:25\t小璃\t好 那你在家休息`
+    },
+    {
+      name: "11_高位冷淡_黑貓傾向",
+      expectedPOV: {
+        阿晨: "高冷黑貓型",
+        小璃: "黃金獵犬型",
+      },
+      text: `2026/04/10（五）
+09:10\t小璃\t早安 你起床了嗎
+11:48\t阿晨\t剛醒
+11:50\t小璃\t昨天是不是很晚睡
+11:58\t阿晨\t嗯
+12:04\t小璃\t那你今天記得吃東西
+16:42\t阿晨\t知道
+19:20\t小璃\t你晚上在幹嘛
+21:06\t阿晨\t在家
+21:08\t小璃\t好吧 那你先忙
+21:16\t阿晨\t嗯`
+    },
+    {
+      name: "12_撒嬌依附但不爆追_哈比小狗傾向",
+      expectedPOV: {
+        阿晨: "哈比小狗型",
+        小璃: "柴犬型",
+      },
+      text: `2026/04/10（五）
+09:12\t阿晨\t早安 我剛剛路過那家店又想到你
+10:40\t小璃\t哈哈 哪家
+10:44\t阿晨\t就上次你說奶茶太甜那家
+10:49\t小璃\t喔喔 那家
+10:52\t阿晨\t你今天下班後有空嗎
+13:20\t小璃\t不一定
+13:24\t阿晨\t好吧 那你忙完再看看
+18:08\t阿晨\t我剛下班
+20:40\t小璃\t今天可能不行
+20:43\t阿晨\t好 沒事 你先忙你的
+20:44\t阿晨\t我只是有點想你而已`
     }
+  ];
+
+  function loadTestCase(index) {
+    const test = TEST_CASES[index];
+    if (!test) return;
+
+    appState.file = null;
+    appState.rawText = test.text;
+    appState.isDemoMode = true;
+
+    ui.statusBox.textContent = `已載入測試案例：${test.name}`;
+    
+    // 自動進入分析流程的第一步：解析文本並顯示身份選擇
+    startV3AnalysisFlow();
   }
+
+  function renderTestCaseButtons(containerId = "testCaseButtons") {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+
+    container.innerHTML = "";
+    TEST_CASES.forEach((test, index) => {
+      const btn = document.createElement("button");
+      btn.className = "speaker-btn";
+      btn.textContent = test.name;
+      btn.title = `預期：${JSON.stringify(test.expectedPOV)}`;
+      btn.onclick = () => loadTestCase(index);
+      container.appendChild(btn);
+    });
+  }
+
+if (typeof window !== 'undefined') {
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initApp);
+  } else {
+    initApp();
+  }
+}

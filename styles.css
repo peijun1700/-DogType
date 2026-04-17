@@ -809,3 +809,26 @@ summary {
   opacity: 0.8;
 }
 
+/* V3.3 Test Suite Styling */
+.test-suite {
+  margin-top: 24px;
+  padding: 16px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.4);
+}
+
+.test-case-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+  gap: 8px;
+}
+
+.test-case-grid .speaker-btn {
+  padding: 8px 12px;
+  font-size: 0.72rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: center;
+}
