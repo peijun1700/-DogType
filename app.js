@@ -279,6 +279,7 @@ function initApp() {
     ui.fileInput.addEventListener("change", handleFileSelect);
   }
   if (ui.analyzeButton) {
+    ui.analyzeButton.disabled = false; // 解鎖按鈕以支援 DEMO 模式
     ui.analyzeButton.addEventListener("click", () => startV3AnalysisFlow());
   }
   if (ui.downloadButton) {
@@ -1156,6 +1157,8 @@ function analyzeMessages(messages, subjectName = null) {
     anxietySignal,
     isConservative, // 傳入保守模式標記
   });
+  const attachmentPressureA = computeAttachmentPressure(messages, speakerA);
+  const attachmentPressureB = computeAttachmentPressure(messages, speakerB);
 
   const inputForClassification = {
     messages,
@@ -1170,6 +1173,10 @@ function analyzeMessages(messages, subjectName = null) {
     rawGhostingPenalty,
     initiationBias,
     messageBalance,
+    attachmentPressure: {
+      [speakerA]: attachmentPressureA,
+      [speakerB]: attachmentPressureB
+    },
     jitterMinutes: jitter,
     isConservative, // 傳入保守模式標記
     responsePairCount: responsePairs.length,
@@ -1187,11 +1194,11 @@ function analyzeMessages(messages, subjectName = null) {
   const cpSignals = computeDogSignals(inputForClassification, counterpartName, myBaseSignals.powerScore);
 
   const myScores = classifyDogType(inputForClassification, povSpeaker, cpSignals.powerScore);
-  const dogType = resolvePrimaryType(myScores, inputForClassification, povSpeaker);
+  const dogType = determinePrimaryType(inputForClassification, povSpeaker, cpSignals.powerScore);
   const personalityMix = calculatePersonalityMix(myScores, dogType);
 
   const cpScores = classifyDogType(inputForClassification, counterpartName, mySignals.powerScore);
-  const counterpartType = resolvePrimaryType(cpScores, inputForClassification, counterpartName);
+  const counterpartType = determinePrimaryType(inputForClassification, counterpartName, mySignals.powerScore);
 
   const myPower = mySignals.powerScore;
   const cpPower = cpSignals.powerScore;
@@ -1243,6 +1250,7 @@ function analyzeMessages(messages, subjectName = null) {
       cpPower: round(cpPower),
       powerGap: round(myPower - cpPower),
       isPursuer,
+      attachmentPressure: mySignals.attachmentPressure,
       baselineMrt: round(baselineMrt),
       trailingSilence: round(trailingSilence),
       isAbnormalSilence,
@@ -1468,6 +1476,8 @@ function computeDogSignals(input, targetSpeaker, counterpartPower = 0) {
       input.syncRate < 30 &&
       input.relationshipModel === "斷線關係"
     );
+  const attachmentPressure = (input.attachmentPressure || {})[targetSpeaker] || 0;
+
   return {
     myInitiation,
     myMessageShare,
@@ -1491,6 +1501,7 @@ function computeDogSignals(input, targetSpeaker, counterpartPower = 0) {
     payloadWeak,
     chaotic,
     nearZombie,
+    attachmentPressure,
   };
 }
 
@@ -1562,10 +1573,24 @@ function classifyDogType(input, targetSpeaker = null, counterpartPower = 0) {
   }
 
   if (model === "單向輸出" && s.isPursuer) {
-    if (input.avgPayloadScore > 0.62) {
-      scores["黃金獵犬型"] += 26;
+    const goldenGate =
+      input.avgPayloadScore >= 0.58 &&
+      input.doublePingPenalty < 8 &&
+      input.ghostingPenalty < 12 &&
+      !input.anxietySignal &&
+      s.attachmentPressure < 5;
+
+    if (goldenGate) {
+      if (input.avgPayloadScore > 0.62) {
+        scores["黃金獵犬型"] += 26;
+      } else {
+        scores["黃金獵犬型"] += 14;
+      }
     } else {
-      scores["黃金獵犬型"] += 14;
+      // 未過 gate，依附壓力轉流浪狗
+      if (s.attachmentPressure >= 3) {
+        scores["流浪狗型"] += 20;
+      }
     }
   }
 
@@ -1607,12 +1632,6 @@ function classifyDogType(input, targetSpeaker = null, counterpartPower = 0) {
     if (input.avgPayloadScore >= 0.9) {
       scores["貴賓狗型"] += 8;
     }
-    // 依據地位差分流
-    if (s.isPursuer) {
-      scores["黃金獵犬型"] += 8;
-    } else if (s.isHighPosition) {
-      scores["佛系和尚狗型"] += 8;
-    }
   }
 
   if (input.avgLatencyScore < 0.45) {
@@ -1634,6 +1653,11 @@ function classifyDogType(input, targetSpeaker = null, counterpartPower = 0) {
     if (input.doublePingPenalty >= 15) scores["流浪狗型"] += 28;
     if (input.anxietySignal && input.syncRate < 60) scores["流浪狗型"] += 16;
     if (input.syncRate < 50) scores["流浪狗型"] += 10;
+
+    if (s.attachmentPressure >= 6) {
+      scores["流浪狗型"] += 24;
+      scores["吉娃娃型"] += 12;
+    }
 
     if (input.doublePingPenalty >= 12 && input.avgPayloadScore < 0.45) {
       scores["吉娃娃型"] += 38;
@@ -1683,9 +1707,7 @@ function classifyDogType(input, targetSpeaker = null, counterpartPower = 0) {
     if (topScore === 0) {
       if (s.isPassive && input.stabilityFlag === "STABLE") {
         scores["佛系和尚狗型"] += 16;
-      } else if (input.stabilityFlag === "STABLE") {
-        scores["柴犬型"] += 16;
-      } else {
+      } else if (input.stabilityFlag === "STABLE" && !input.anxietySignal && s.attachmentPressure < 3) {
         scores["黃金獵犬型"] += 12;
       }
     }
@@ -1713,7 +1735,14 @@ function classifyDogType(input, targetSpeaker = null, counterpartPower = 0) {
     scores["柴犬型"] += 8;
   }
 
-  if (model === "單向輸出" && s.isPursuer && input.avgPayloadScore > 0.55) {
+  if (
+    model === "單向輸出" &&
+    s.isPursuer &&
+    input.avgPayloadScore > 0.55 &&
+    input.doublePingPenalty < 8 &&
+    !input.anxietySignal &&
+    s.attachmentPressure < 5
+  ) {
     scores["黃金獵犬型"] += 8;
   }
 
@@ -1752,19 +1781,21 @@ function canBeBorderCollie(input, targetSpeaker) {
   const otherShare = otherSpeaker ? (input.messageBalance[otherSpeaker] || 0.5) : 0.5;
   const initGap = Math.abs(init - otherInit);
   const shareGap = Math.abs(share - otherShare);
+
   return (
     input.relationshipModel === "雙向同步" &&
-    input.avgLatencyScore >= 0.72 &&
-    input.avgPayloadScore >= 0.58 &&
+    input.avgLatencyScore >= 0.78 &&
+    input.avgPayloadScore >= 0.62 &&
     input.stabilityFlag === "STABLE" &&
-    init >= 0.35 &&
-    init <= 0.65 &&
-    share >= 0.38 &&
-    share <= 0.62 &&
-    initGap <= 0.28 &&
-    shareGap <= 0.22 &&
-    input.doublePingPenalty <= 4 &&
-    !input.anxietySignal
+    init >= 0.4 &&
+    init <= 0.6 &&
+    share >= 0.42 &&
+    share <= 0.58 &&
+    initGap <= 0.18 &&
+    shareGap <= 0.16 &&
+    input.doublePingPenalty <= 2 &&
+    !input.anxietySignal &&
+    input.ghostingPenalty === 0
   );
 }
 
@@ -2644,6 +2675,25 @@ function classifyRelationship(input) {
     }
 
     return false;
+  }
+
+  /**
+   * 【V4.5 優化】依附壓力計算法
+   * 將此函式移至全域輔助區，保持 analyzeMessages 結構簡潔
+   */
+  function computeAttachmentPressure(messages, targetSpeaker) {
+    const targetMsgs = messages.filter(m => m.speaker === targetSpeaker);
+    let score = 0;
+    for (const msg of targetMsgs) {
+      const text = msg.content;
+      // 依附焦慮/尋求保證
+      if (/安心了|有點擔心|你還好嗎|你是不是|有沒有怎麼了|我只是有點想你/.test(text)) score += 2;
+      // 日常依附
+      if (/到家了嗎|吃了嗎|睡了嗎/.test(text)) score += 1;
+      // 追問/焦慮補償
+      if (/你怎麼沒回|你不想聊嗎|你是不是在忙/.test(text)) score += 3;
+    }
+    return score;
   }
 
   function isSoftAcknowledgement(text) {
